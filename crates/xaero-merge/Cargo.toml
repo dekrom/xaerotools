@@ -1,0 +1,16 @@
+[package]
+name = "xaero-merge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+xaero-core = { path = "../xaero-core" }
+xaero-db = { path = "../xaero-db" }
+xaero-scan = { path = "../xaero-scan" }
+filetime = "0.2"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+xaero-core = { path = "../xaero-core" }

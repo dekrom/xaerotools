@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>XaeroTools</title>
+  </head>
+  <body>
+    <div id="app">
+      <main id="map"></main>
+
+      <nav id="toolbar">
+        <span id="brand">XaeroTools</span>
+        <button class="tb-btn" data-panel="panel-world">World</button>
+        <button class="tb-btn" data-panel="panel-display">Display</button>
+        <button class="tb-btn" data-panel="hl-panel">Overlays</button>
+        <button class="tb-btn" data-panel="panel-goto">Go to</button>
+        <button class="tb-btn" data-panel="panel-wp">Waypoints</button>
+        <button class="tb-btn" data-panel="panel-players">Players</button>
+        <button class="tb-btn" data-panel="panel-share">Share</button>
+        <button class="tb-btn" data-panel="tools-view">Tools</button>
+      </nav>
+
+      <div class="float-panel" id="panel-world" data-title="World &amp; map" hidden>
+        <label>World</label>
+        <select id="world-select"></select>
+        <label>Dimension</label>
+        <div id="dim-list"></div>
+        <label>Map</label>
+        <select id="mw-select"></select>
+        <label>Layer</label>
+        <select id="layer-select"></select>
+        <div class="fp-group" id="roots-group" hidden>
+          <label>Map roots</label>
+          <ul id="root-list"></ul>
+          <input id="root-add-path" placeholder="/path/to/xaero or world-map" spellcheck="false" />
+          <div class="goto-row">
+            <button id="root-browse">Browse…</button>
+            <button id="root-add">Add root</button>
+          </div>
+          <div id="fs-browser" hidden>
+            <div id="fs-path" class="muted"></div>
+            <ul id="fs-list"></ul>
+          </div>
+          <span id="root-status" class="muted"></span>
+        </div>
+      </div>
+
+      <div class="float-panel" id="panel-share" data-title="Live share" hidden>
+        <label>Server URL (paste into the companion addon)</label>
+        <div class="goto-row">
+          <input id="share-url" readonly spellcheck="false" />
+          <button id="share-url-copy" title="Copy the URL">Copy</button>
+        </div>
+        <div class="fp-group" id="share-tokens-group" hidden>
+          <label>Player tokens</label>
+          <ul id="token-list"></ul>
+          <input id="token-player" placeholder="account name (as it appears in game)" spellcheck="false" />
+          <div class="goto-row">
+            <button id="token-generate">Generate token</button>
+          </div>
+          <div id="token-reveal" hidden>
+            <div class="muted">
+              Token for <b id="token-reveal-player"></b> — shown once, copy it now:
+            </div>
+            <div class="goto-row">
+              <input id="token-reveal-value" readonly spellcheck="false" />
+              <button id="token-copy" title="Copy the token">Copy</button>
+            </div>
+          </div>
+          <span id="token-status" class="muted"></span>
+        </div>
+        <div class="fp-group" id="share-lan-note" hidden>
+          <span class="muted">
+            Token management is local-only — generate tokens on the server box
+            (open this map there, or run <code>xaerotools tokens generate</code>).
+          </span>
+        </div>
+        <div class="fp-group">
+          <label>How it works</label>
+          <ol class="muted share-howto">
+            <li>Install the XaeroTools Companion addon (Meteor Client).</li>
+            <li>Enable <b>XaeroTools&nbsp;Sync</b>, paste the URL and a token.</li>
+            <li><code>.xt sync</code> once uploads the whole local map; new mapping streams automatically.</li>
+          </ol>
+          <div class="muted" id="share-ingest-dir"></div>
+          <div class="muted">
+            Beyond a trusted LAN, share only over a VPN (Tailscale) or a TLS proxy.
+          </div>
+        </div>
+      </div>
+
+      <div class="float-panel" id="panel-players" data-title="Players (live)" hidden>
+        <label class="row" title="Short fading trail behind each live marker">
+          <input type="checkbox" id="toggle-trails" /> Show trails
+        </label>
+        <ul id="player-list"></ul>
+        <span id="live-status" class="muted"></span>
+      </div>
+
+      <div class="float-panel" id="panel-display" data-title="Display" hidden>
+        <label class="row"><input type="checkbox" id="toggle-waypoints" checked /> Waypoints</label>
+        <label class="row"><input type="checkbox" id="toggle-guides" checked /> Highways &amp; border</label>
+        <label class="row"><input type="checkbox" id="toggle-grid" /> Region grid</label>
+        <label class="row" id="row-live-overlay" hidden
+          title="Draw the merged live uploads (companion addon) on top of this world's own tiles, so fresh mapping appears right where you are looking">
+          <input type="checkbox" id="toggle-live-overlay" checked /> Live uploads overlay
+        </label>
+        <label class="row" id="row-live-preview"
+          title="Terrain companion clients are seeing right now, drawn the moment it arrives — before Xaero has even saved it to disk. Replaced by real map data as regions upload.">
+          <input type="checkbox" id="toggle-live-preview" checked /> Live preview (unsaved terrain)
+        </label>
+        <label class="row" id="row-nether" hidden>
+          <input type="checkbox" id="toggle-nether" /> Nether underlay (1:8)
+        </label>
+        <div class="fp-group">
+          <label class="row" id="row-atlas-under" hidden
+            title="Community WDL imagery from your local Atlas mirror, shown under your own map data (run scripts/atlas-mirror.py to create the mirror). Served entirely from disk.">
+            <input type="checkbox" id="toggle-atlas-under" /> Atlas map underlay
+          </label>
+          <label class="row" title="Downloads the POI list from 2b2tatlas.com (api.blackportal.cloud) once, then keeps it on disk. Nothing is sent except the request itself.">
+            <input type="checkbox" id="toggle-atlas" /> 2b2t Atlas POIs
+          </label>
+          <input id="atlas-filter" type="search" placeholder="filter by name/tag…" hidden />
+          <span id="atlas-count" class="muted"></span>
+          <button id="atlas-refresh" hidden
+            title="Re-download the POI list from api.blackportal.cloud. The stored copy never expires on its own.">Refresh POIs</button>
+          <details id="atlas-mirror">
+            <summary>Offline mirror</summary>
+            <div id="atlas-mirror-body" class="muted"></div>
+          </details>
+        </div>
+      </div>
+
+      <div class="float-panel" id="hl-panel" data-title="XaeroPlus overlays" hidden>
+        <div id="hl-list"></div>
+      </div>
+
+      <div class="float-panel" id="panel-goto" data-title="Go to" hidden>
+        <div class="goto-row">
+          <input id="goto-x" type="number" placeholder="X" />
+          <input id="goto-z" type="number" placeholder="Z" />
+          <button id="goto-btn">Go</button>
+        </div>
+      </div>
+
+      <div class="float-panel" id="panel-wp" data-title="Waypoints" hidden>
+        <input id="wp-search" type="search" placeholder="filter…" />
+        <label class="row" title="Waypoints preserved by the vault after being deleted in game">
+          <input type="checkbox" id="toggle-archived" checked /> Show archived (vault)
+        </label>
+        <div class="goto-row">
+          <button id="vault-sync-btn" title="Back up all live waypoints into the vault now">Sync vault</button>
+        </div>
+        <span id="vault-status" class="muted"></span>
+        <ul id="wp-list"></ul>
+      </div>
+
+      <div class="float-panel wide" id="tools-view" data-title="Tools" hidden>
+        <section class="tool-card">
+          <h3>Merge map folders</h3>
+          <p class="muted">
+            Combines two Xaero archives into a fresh output folder — regions merged
+            <b>tile by tile</b> on conflicts, caches skipped, XaeroPlus DBs and waypoints
+            merged too. <b>Your sources are never modified.</b> Nothing is written until Apply.
+          </p>
+          <label>Side A (root, world-map or world folder)</label>
+          <input id="mg-a" list="dl-roots" placeholder="/path/to/old-backup" spellcheck="false" />
+          <label>Side B</label>
+          <input id="mg-b" list="dl-roots" placeholder="/path/to/.minecraft" spellcheck="false" />
+          <label>Output folder (must not exist or be empty)</label>
+          <input id="mg-out" placeholder="/path/to/merged" spellcheck="false" />
+          <div class="goto-row">
+            <select id="mg-prefer">
+              <option value="mtime">conflicts: newest file wins</option>
+              <option value="a">conflicts: prefer side A</option>
+              <option value="b">conflicts: prefer side B</option>
+            </select>
+            <label class="row inline" title="Pair worldId splits like Multiplayer_2b2t and Multiplayer_2b2t.org as one world">
+              <input type="checkbox" id="mg-autoalias" /> auto-pair split worlds
+            </label>
+          </div>
+          <div class="goto-row">
+            <button id="mg-dry">Dry run</button>
+            <button id="mg-apply" disabled>Apply</button>
+            <span id="mg-status" class="muted"></span>
+          </div>
+          <div id="mg-report" class="tool-report"></div>
+        </section>
+        <section class="tool-card">
+          <h3>Merge XaeroPlus databases</h3>
+          <p class="muted">
+            NewChunks / OldChunks / Portals / … highlight DBs, schema v0/v1/v2 aware,
+            <b>oldest first-seen wins</b> so your history is preserved. The output is a fresh
+            copy of Base; Base and all sources stay untouched.
+          </p>
+          <label>Base DB</label>
+          <input id="db-base" list="dl-dbs" placeholder="/path/XaeroPlusOldChunks.db" spellcheck="false" />
+          <label>Merge in (one .db path per line)</label>
+          <textarea id="db-sources" rows="3" spellcheck="false"></textarea>
+          <label>Output DB (must not exist)</label>
+          <input id="db-out" placeholder="/path/Merged.db" spellcheck="false" />
+          <div class="goto-row">
+            <button id="db-dry">Dry run</button>
+            <button id="db-apply" disabled>Apply</button>
+            <span id="db-status" class="muted"></span>
+          </div>
+          <div id="db-report" class="tool-report"></div>
+        </section>
+        <datalist id="dl-roots"></datalist>
+        <datalist id="dl-dbs"></datalist>
+      </div>
+
+      <footer id="statusbar">
+        <span id="coords">X: – Z: –</span>
+        <span id="tile-loading" hidden>rendering tiles…</span>
+        <span id="map-name"></span>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

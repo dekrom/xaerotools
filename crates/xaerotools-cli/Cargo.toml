@@ -1,0 +1,17 @@
+[package]
+name = "xaerotools"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+png = "0.18.1"
+rayon = "1"
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
+xaero-core = { version = "0.1.0", path = "../xaero-core" }
+xaero-db = { version = "0.1.0", path = "../xaero-db" }
+xaero-merge = { version = "0.1.0", path = "../xaero-merge" }
+xaero-scan = { version = "0.1.0", path = "../xaero-scan" }
+xaerotools-server = { version = "0.1.0", path = "../xaerotools-server" }

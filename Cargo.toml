@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/xaero-core", "crates/xaero-db", "crates/xaero-merge", "crates/xaero-scan", "crates/xaerotools-server", "crates/xaerotools-cli", "tools/xaero-colorgen"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["XaeroTools contributors"]
+repository = "https://github.com/dekrom/xaerotools"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Fast-enough dev builds for the 400 MB corpus tests
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1

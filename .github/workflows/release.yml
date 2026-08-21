@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write # build provenance attestations
+  attestations: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            name: xaerotools-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: xaerotools-windows-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: xaerotools-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            name: xaerotools-macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci && npm run build
+        working-directory: webui
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release -p xaerotools --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          BIN=target/${{ matrix.target }}/release/xaerotools
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          cp "$BIN" dist/
+          cp README.md LICENSE dist/ 2>/dev/null || cp README.md dist/
+          cd dist && 7z a ../${{ matrix.name }}.zip . || zip -r ../${{ matrix.name }}.zip .
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ matrix.name }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}.zip
+
+  # One job attaches all four zips to a single draft release — parallel
+  # matrix legs each creating a draft for the same tag race into duplicates.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: "*.zip"
+          draft: true
+          generate_release_notes: true
