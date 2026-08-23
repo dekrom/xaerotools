@@ -10,6 +10,8 @@
 
 **[Download for Windows / macOS / Linux](https://github.com/dekrom/xaerotools/releases/latest)** — unzip, double-click, done.
 
+[Setup guide](#get-started) · [Share a map with your friends](#playing-together) · [Something didn't work?](#faq--something-didnt-work)
+
 <img src="assets/viewer.webp" alt="A 2b2t archive in the XaeroTools viewer — spawn and its highway web, with overlays, waypoints, live share and merge tools open" width="900">
 
 *A real 2b2t archive in the viewer: spawn's highway web, XaeroPlus overlays,
@@ -44,47 +46,123 @@ map as they travel, before the game has even saved it.
 
 ## Get started
 
-1. **Download** the [latest release](https://github.com/dekrom/xaerotools/releases/latest)
-   for your system:
+Three steps, no installer, no account, nothing to configure.
 
-   | System | File |
-   |---|---|
-   | Windows | `xaerotools-windows-x86_64.zip` |
-   | Linux | `xaerotools-linux-x86_64.zip` |
-   | macOS (Apple Silicon) | `xaerotools-macos-arm64.zip` |
-   | macOS (Intel) | `xaerotools-macos-x86_64.zip` |
+### 1. Download
 
-2. **Unzip and run** `xaerotools` — a single portable file, no installer, no
-   admin rights. A console window opens: that window is the app — keep it
-   open; closing it stops the map.
+Pick the one file for your system from the
+**[latest release](https://github.com/dekrom/xaerotools/releases/latest)**:
 
-   > **Windows**: the first run shows a blue "Windows protected your PC"
-   > screen. The app is unsigned, not unsafe — every download is built in
-   > public by GitHub Actions and checksummed in `SHA256SUMS.txt`. Click
-   > **More info**, then **Run anyway**. Only needed once.
+| Your system | File to download |
+|---|---|
+| **Windows** (any modern PC) | `xaerotools-windows-x86_64.zip` |
+| **macOS** — Apple Silicon (M1–M4) | `xaerotools-macos-arm64.zip` |
+| **macOS** — Intel | `xaerotools-macos-x86_64.zip` |
+| **Linux** | `xaerotools-linux-x86_64.zip` |
 
-   > **macOS**: the first run is blocked ("Apple could not verify…"). Unblock
-   > it once: open Terminal (Cmd+Space, type `Terminal`), paste
-   > `xattr -d com.apple.quarantine` followed by a space, drag the unzipped
-   > `xaerotools` file into the window, press Enter. Then double-click it.
-   > (Alternative: System Settings → Privacy & Security → **Open Anyway**.)
+Not sure which Mac you have?  menu → **About This Mac**. A chip that starts
+with "Apple M" means Apple Silicon; anything saying Intel means Intel.
 
-3. **The browser opens by itself with your map.** It finds maps from the
-   vanilla launcher and from CurseForge, Modrinth App, Prism Launcher,
-   MultiMC, ATLauncher and GDLauncher instances automatically. If nothing was
-   found, the page that opens lets you point at your folder — no terminal
-   needed.
+### 2. Unzip it
 
-Backups or maps somewhere else? Add them in the viewer — **World panel →
-Map roots → Browse** — or point at them from a terminal:
+Right-click the downloaded `.zip` → **Extract All** (Windows) or double-click
+it (macOS/Linux). You get a folder with three files: `xaerotools` (the
+program), `START-HERE.txt` and `LICENSE`.
+
+Unzip it somewhere you can find again — your Desktop is fine. **Do not run it
+from inside the zip**; Windows will appear to work and then fail to save
+anything.
+
+### 3. Run it
+
+Double-click **`xaerotools`**. A black console window opens — **that window is
+the app**. Keep it open; closing it stops the map. Your browser then opens by
+itself at `http://127.0.0.1:45746` with your map already loaded.
+
+The first run on Windows and macOS needs one extra click, because the download
+is not code-signed (a certificate costs hundreds per year). Every file is
+built in public by GitHub Actions straight from this source, and
+`SHA256SUMS.txt` on the release page lets you verify what you downloaded.
+
+<details>
+<summary><b>Windows — "Windows protected your PC"</b></summary>
+
+A blue box appears. Click **More info**, then the **Run anyway** button that
+appears underneath. Once, ever.
+
+If SmartScreen is set to block instead of warn, or your antivirus quarantines
+the file: right-click the `.zip` before extracting → **Properties** → tick
+**Unblock** → **OK**, then extract again.
+
+</details>
+
+<details>
+<summary><b>macOS — "Apple could not verify this app"</b></summary>
+
+Easiest way: **System Settings → Privacy & Security**, scroll down — right
+after you try to open it there is a line about `xaerotools` being blocked,
+with an **Open Anyway** button. Click it, then confirm.
+
+Or from Terminal (Cmd+Space, type `Terminal`, Enter). Type this, **with a
+space at the end**:
 
 ```
-.\xaerotools serve --root "D:\backups\xaero" --root "C:\Users\you\.minecraft" --open
+xattr -d com.apple.quarantine 
 ```
 
-(To open a terminal in the unzipped folder on Windows: type `cmd` into the
-Explorer address bar and press Enter. PowerShell needs the `.\` prefix; plain
-`xaerotools` also works in cmd.)
+then drag the unzipped `xaerotools` file into the Terminal window (it pastes
+the path for you) and press Enter. Now double-click it.
+
+</details>
+
+<details>
+<summary><b>Linux — it will not start</b></summary>
+
+Mark it executable, then run it:
+
+```
+chmod +x xaerotools
+./xaerotools
+```
+
+</details>
+
+### What you should see
+
+The console window prints the address it is serving on and how many maps it
+found, then your browser opens. XaeroTools looks for map folders on its own —
+the vanilla launcher plus CurseForge, Modrinth App, Prism Launcher, MultiMC,
+ATLauncher and GDLauncher instances.
+
+**Found nothing?** The page that opens has a folder picker — click **Browse**,
+point it at your map folder, done. No terminal needed. You are looking for a
+folder called `xaero` (or `XaeroWorldMap` inside it). Common locations:
+
+| Launcher | Where the map folder lives |
+|---|---|
+| Vanilla launcher (Windows) | `%APPDATA%\.minecraft\xaero` |
+| Vanilla launcher (macOS) | `~/Library/Application Support/minecraft/xaero` |
+| Vanilla launcher (Linux) | `~/.minecraft/xaero` |
+| CurseForge | `C:\Users\YOU\curseforge\minecraft\Instances\PACK\xaero` |
+| Modrinth App | `%APPDATA%\ModrinthApp\profiles\PROFILE\xaero` |
+| Prism / MultiMC | `…\instances\INSTANCE\.minecraft\xaero` |
+
+You can add as many folders as you like — old backups, a friend's copy, an
+external drive. They all show up in the same viewer, and XaeroTools only ever
+*reads* them.
+
+<details>
+<summary><b>Starting it from a terminal instead (optional)</b></summary>
+
+```
+xaerotools serve --root "D:\backups\xaero" --root "C:\Users\you\.minecraft" --open
+```
+
+To open a terminal in the unzipped folder on Windows, type `cmd` into the
+Explorer address bar and press Enter. In PowerShell you need the `.\` prefix
+(`.\xaerotools`); in `cmd` plain `xaerotools` works.
+
+</details>
 
 ## The map viewer
 
@@ -148,34 +226,210 @@ their own.
 
 ## Playing together
 
-The map is live while the game runs: new exploring shows up in the browser by
-itself, no reloads.
+The map is live on its own: while the game runs, new exploring appears in the
+browser without reloading anything.
 
-With the **[companion Meteor addon](https://github.com/dekrom/xaerotools-companion)**,
-your group can run one shared map:
+To build **one shared map from everyone's exploring**, one person runs
+XaeroTools and everyone installs the
+**[Companion addon](https://github.com/dekrom/xaerotools-companion)**. You get
+live player markers, a terrain preview seconds ahead of the saved data, and
+every player's freshly-mapped regions merged into a single map — plus a
+private per-player backup on the host.
 
-- Everyone appears as a **live marker** with a player list, click-to-follow
-  and optional trails.
-- A **live preview** sketches the terrain each player is currently seeing
-  onto the shared map, seconds ahead of the real data.
-- Freshly mapped regions upload automatically. The server keeps a private
-  per-player backup **and** merges everyone's exploring into one shared map.
-  Cave layers stay local unless a client opts in — and the server can refuse
-  them outright with `--ingest-no-caves`.
-- `.xt sync` uploads a whole existing map once — instant off-site backup.
+### Who needs what
 
-Any Companion release works with any XaeroTools release 0.2 or newer.
+| | Needs |
+|---|---|
+| **The host** — one person, the "server" | XaeroTools running on their PC, left open. A decent upload and a machine that stays on. |
+| **Each player** — including the host | Fabric + Meteor Client + Xaero's World Map + the Companion addon |
+| **Watching only** | Nothing. Just the map's address in a browser. |
 
-Each player gets their own access token — generate it in the map's **Share
-panel**, or with `xaerotools tokens generate <name>`. To share on your LAN:
+The host does **not** need a dedicated server, a VPS or a domain. A normal PC
+is fine. Any Companion release works with any XaeroTools release 0.2 or newer.
+
+### Step 1 — the host starts the server
+
+Pick the situation that matches your group.
+
+<details open>
+<summary><b>A. Just testing on your own PC</b></summary>
+
+Run XaeroTools normally (double-click it). The address is
+`http://127.0.0.1:45746` and the addon's defaults already point there. **No
+token needed** — the addon and the server are on the same machine.
+
+Skip straight to [Step 3](#step-3--each-player-installs-the-mods).
+
+</details>
+
+<details>
+<summary><b>B. Friends in the same house (same Wi-Fi/router)</b></summary>
+
+Open a terminal in the unzipped folder and start it in LAN mode. A password is
+mandatory — without it everyone on the network could read your map:
 
 ```
-xaerotools serve --lan --password mysecret
+xaerotools serve --lan --password pick-a-password
 ```
 
-The first `--lan` run makes Windows Firewall ask to allow network access —
-tick **Private networks**. For friends outside your LAN, use a VPN like
-Tailscale — the server speaks plain HTTP on purpose.
+Windows will pop up a firewall prompt the first time. **Tick "Private
+networks" and allow it** — if you miss this, nobody can connect.
+
+Now find your PC's local address:
+
+| | Command | Look for |
+|---|---|---|
+| Windows | `ipconfig` | `IPv4 Address` — e.g. `192.168.1.42` |
+| macOS / Linux | `ip addr` (or `ifconfig`) | the `192.168.x.x` / `10.x.x.x` address |
+
+Your group's address is then `http://192.168.1.42:45746` — substitute your own
+number. Give players that address and the password.
+
+</details>
+
+<details>
+<summary><b>C. Friends over the internet (recommended: Tailscale)</b></summary>
+
+XaeroTools speaks plain HTTP on purpose, so do **not** port-forward it to the
+open internet. Put everyone on the same private network instead —
+[Tailscale](https://tailscale.com) is free for personal use and takes about
+two minutes:
+
+1. Install Tailscale on the host **and** on each player's PC, and sign in with
+   the same account (or share the network with them from the Tailscale admin
+   panel).
+2. On the host, get its Tailscale address: `tailscale ip -4` — it looks like
+   `100.101.102.103`.
+3. Start the server the same way as LAN mode:
+
+   ```
+   xaerotools serve --lan --password pick-a-password
+   ```
+
+4. Players use `http://100.101.102.103:45746`.
+
+This is encrypted end to end by Tailscale, works from anywhere, and needs no
+router changes. A TLS reverse proxy in front of XaeroTools is the other valid
+option if you already run one.
+
+</details>
+
+### Step 2 — the host makes one token per player
+
+Each player gets their own token, tied to their account name. On the **host's**
+machine, in a second terminal (the server can keep running — new tokens are
+picked up immediately, no restart):
+
+```
+xaerotools tokens generate Notch
+```
+
+It prints the token **once**. Copy it and send it to that player privately —
+a DM, not a public channel. Repeat per player. `xaerotools tokens list` shows
+who has one; `xaerotools tokens revoke <name>` takes it back.
+
+> **Note:** the map's **Share panel** can also mint tokens, but only when the
+> server is running unprotected on your own machine. Starting it with
+> `--lan --password` deliberately disables token, merge and map-root
+> management in the web UI — otherwise anyone with the password could mint
+> credentials. **When you are sharing, use the command above.**
+
+The name must match the Minecraft account that will use it. Players on the
+same PC using several alts can put one `NAME=TOKEN` line per account into the
+addon's `account-tokens` list.
+
+### Step 3 — each player installs the mods
+
+In order. All four go in the same `mods` folder:
+
+1. **[Fabric Loader](https://fabricmc.net/use/installer/)** for your Minecraft
+   version — run the installer, pick your version, install.
+2. **[Meteor Client](https://meteorclient.com/)** — download the jar for the
+   same Minecraft version.
+3. **[Xaero's World Map](https://modrinth.com/mod/xaeros-world-map)** — this is
+   what actually draws the map the addon uploads.
+   ([XaeroPlus](https://github.com/rfresh2/XaeroPlus) on top is optional and
+   works great.)
+4. **The Companion jar** — from the
+   [latest Companion release](https://github.com/dekrom/xaerotools-companion/releases/latest),
+   **exactly one**, matching your Minecraft version.
+
+Where the `mods` folder is:
+
+| Launcher | Path |
+|---|---|
+| Vanilla launcher (Windows) | `%APPDATA%\.minecraft\mods` |
+| Vanilla launcher (macOS) | `~/Library/Application Support/minecraft/mods` |
+| Vanilla launcher (Linux) | `~/.minecraft/mods` |
+| CurseForge / Prism / MultiMC / Modrinth | that instance's own `mods` folder |
+
+Paste the address into Windows Explorer or press Cmd+Shift+G in Finder. Start
+the game once to confirm all four load.
+
+### Step 4 — each player points the addon at the server
+
+In game, open Meteor's GUI (**Right Shift** by default) and click the
+**XaeroTools** tab in the top bar, next to Config. Under **Connection**:
+
+| Setting | What to put |
+|---|---|
+| `server-url` | The host's address, e.g. `http://192.168.1.42:45746` |
+| `token` | The token the host sent you. Leave empty if the server runs on *your* PC. |
+| `player-name` | Leave empty — it uses your account name. Only set it if your token was made for a different spelling. |
+
+Then flip **enabled** on (or type `.xt on` in chat). `.xt status` tells you
+whether it is connected.
+
+### Step 5 — the first upload
+
+Each player runs this once, in chat:
+
+```
+.xt sync
+```
+
+That uploads the map you already have — the initial backup. It can take a
+while on a big archive; `.xt status` shows the queue draining. Afterwards the
+watcher keeps everything current by itself: explore, and regions upload
+seconds after the game saves them.
+
+### Watching the shared map
+
+Anyone opens the host's address in a browser — `http://192.168.1.42:45746`,
+or `127.0.0.1:45746` on the host itself. With `--lan` you are asked for the
+password once. You will see live markers for everyone connected, a Players
+panel with click-to-follow, and the merged map filling in as people explore.
+
+### Chat commands
+
+| Command | Does |
+|---|---|
+| `.xt on` / `.xt off` | Turn the live link on or off |
+| `.xt status` | Connection, queue length, what has been sent |
+| `.xt sync` | Upload your whole existing map once |
+| `.xt sync <world>` | Same, but only one world |
+| `.xt ping` | Send one position now — tests the connection |
+
+### What actually gets shared
+
+Your position, and the map regions your game saves. **Cave layers stay on your
+PC** unless you turn `upload-caves` on, and the host can refuse them outright
+with `--ingest-no-caves`. The addon only ever *reads* your Xaero folder — your
+own local map keeps working exactly as before. Nothing is sent anywhere except
+the server address you typed in.
+
+### If it is not working
+
+| Symptom | Fix |
+|---|---|
+| `.xt status` says not connected | Check `server-url` — it needs `http://` and the port, e.g. `http://192.168.1.42:45746`. |
+| Connection refused / times out | The server is not running, or the firewall blocked it. On Windows, allow `xaerotools` on **Private networks**. |
+| `401 unauthorized` | Wrong or revoked token, or it was minted for a different account name. Host: `xaerotools tokens list`, then re-issue. |
+| Works on the host, not for friends | The server was started without `--lan`. Plain `serve` listens on `127.0.0.1` only. |
+| Nobody can reach it over the internet | Use Tailscale (option C). Do not port-forward plain HTTP. |
+| Marker moves, but no terrain appears | Xaero's World Map is not installed, or the game has not saved that area yet. Run `.xt sync` once. |
+| Browser asks for a password you did not set | That is `--lan --password`; ask the host for it. |
+| Share panel says tools are disabled | Expected under `--lan` — use the `tokens` CLI on the host (Step 2). |
 
 ## Every map version since 1.12
 
@@ -249,6 +503,18 @@ live-share client contract in `docs/INGEST.md`.
   two opt-ins are the 2b2t Atlas overlay and `--lan` sharing.
 - **I closed the black window and the map stopped.** By design — that window
   is the app. Double-click `xaerotools` to start it again.
+- **Do I need to close Minecraft first?** No. Run both at once — that is the
+  point. XaeroTools only reads the map files the game writes.
+- **Will this change or break my in-game map?** No. Your game folders are
+  opened read-only. Merges never touch the originals: they write a new folder
+  and are a dry run until you add `--apply`.
+- **How do I update to a new version?** Download the new zip and replace the
+  old `xaerotools` file. Your settings, tokens and waypoint vault live
+  elsewhere (`%APPDATA%\xaerotools` / `~/.local/share/xaerotools`) and are
+  kept.
+- **Can I run it on a home server / Raspberry Pi?** Yes, any always-on Linux
+  box works — use the Linux build with `--lan --password`. It is a single
+  binary with no services to install.
 
 ## Roadmap
 
