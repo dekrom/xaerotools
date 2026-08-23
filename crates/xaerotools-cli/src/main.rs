@@ -12,7 +12,7 @@ mod stats;
 
 use std::path::PathBuf;
 
-use xaero_core::render::{ColorTable, LightMode, RenderOpts};
+use xaero_core::render::{ColorTable, RenderOpts};
 
 pub(crate) static COLORTABLE: &[u8] = include_bytes!("../../../assets/colortable.bin");
 
@@ -23,12 +23,16 @@ fn main() {
         Some("render") => render::render_cmd(&args[1..]),
         Some("stats") => stats::stats_cmd(&args[1..]),
         Some("doctor") => doctor::doctor_cmd(&args[1..]),
-        Some("serve") => serve_cmd(&args[1..]),
+        Some("serve") => serve_cmd(&args[1..], false),
         Some("merge") => merge_cmd(&args[1..]),
         Some("db-merge") => db_merge_cmd(&args[1..]),
         Some("waypoints") => waypoints_cmd(&args[1..]),
         Some("tokens") => tokens_cmd(&args[1..]),
-        None => serve_cmd(&[]),
+        // A bug report that cannot name its build is unanswerable.
+        Some("--version" | "-V") => println!("xaerotools {}", env!("CARGO_PKG_VERSION")),
+        // Bare invocation is the double-click path: open the browser for the
+        // user, they were never going to read a listening-on line.
+        None => serve_cmd(&[], true),
         _ => {
             print_help();
             std::process::exit(2);
@@ -49,7 +53,7 @@ fn print_help() {
     eprintln!("                   [--live-poll]");
     eprintln!("  xaerotools render --bbox x1,z1,x2,z2 | --all  -o out.png");
     eprintln!("                   [--root PATH]... [--world W] [--dim D] [--mw MW]");
-    eprintln!("                   [--cave N | --layer surface|cave:N]");
+    eprintln!("                   [--cave N | --layer surface|cave:N] [--roof]");
     eprintln!("                   [--zoom 0..-9 | --scale PX] [--max-px N]");
     eprintln!("  xaerotools stats  [--root PATH]... [--world W] [--sample N | --full]");
     eprintln!("                   [--no-dbs] [--json]");
@@ -63,6 +67,7 @@ fn print_help() {
     eprintln!("  xaerotools tokens generate <player> [--config PATH]");
     eprintln!("  xaerotools tokens list|revoke <player> [--config PATH]");
     eprintln!("  xaerotools render-region <region.zip> -o out.png [--cave] [--debug-missing]");
+    eprintln!("  xaerotools --version");
     eprintln!();
     eprintln!("The waypoint vault backs up every waypoint it ever sees (all accounts,");
     eprintln!("all instances) — deleting one in game never removes it from the vault.");
@@ -553,9 +558,9 @@ fn db_merge_cmd(args: &[String]) {
     }
 }
 
-fn serve_cmd(args: &[String]) {
+fn serve_cmd(args: &[String], open_default: bool) {
     let mut config = xaerotools_server::ServerConfig::default();
-    let mut open = false;
+    let mut open = open_default;
     let mut lan = false;
     let mut port: u16 = 45746;
     let mut i = 0;
@@ -567,7 +572,10 @@ fn serve_cmd(args: &[String]) {
             }
             "--port" => {
                 i += 1;
-                port = args[i].parse().expect("--port must be a number");
+                port = match args[i].parse() {
+                    Ok(p) => p,
+                    Err(_) => die(2, "--port must be a number"),
+                };
             }
             "--lan" => lan = true,
             "--password" => {
@@ -625,8 +633,10 @@ fn serve_cmd(args: &[String]) {
     let chosen = (port..=last)
         .find(|&candidate| std::net::TcpListener::bind((host, candidate)).is_ok())
         .unwrap_or_else(|| {
-            eprintln!("ports {port}..{last} are all in use — pass --port N");
-            std::process::exit(2);
+            die(
+                2,
+                &format!("ports {port}..{last} are all in use — pass --port N"),
+            )
         });
     if chosen != port {
         eprintln!("port {port} is busy — using {chosen} instead");
@@ -643,10 +653,11 @@ fn serve_cmd(args: &[String]) {
     if config.roots.is_empty() && persisted_roots.is_empty() {
         config.roots = xaero_scan::default_root_candidates();
         if config.roots.is_empty() {
+            // Not fatal: the viewer's first-run screen lets the user point at
+            // a folder from the browser, which beats a vanishing console.
             eprintln!(
-                "no Xaero data found automatically — pass --root <path to .minecraft or xaero folder>"
+                "no Xaero data found automatically — add your .minecraft or backup folder in the browser, or pass --root <path>"
             );
-            std::process::exit(1);
         }
         for r in &config.roots {
             eprintln!("auto-detected root: {}", r.display());
@@ -678,14 +689,64 @@ fn serve_cmd(args: &[String]) {
     let url = format!("http://{}", config.bind);
     eprintln!("XaeroTools listening on {url}");
     if open {
-        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        eprintln!("Your map is in the browser — keep this window open while you use it.");
+        open_browser(&url);
     }
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => die(1, &format!("tokio runtime: {e}")),
+    };
     if let Err(e) = rt.block_on(xaerotools_server::run(config)) {
-        eprintln!("server error: {e}");
-        std::process::exit(1);
+        die(1, &format!("server error: {e}"));
     }
 }
+
+fn open_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    let opened = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let opened = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let opened = std::process::Command::new("xdg-open").arg(url).spawn();
+    if let Err(e) = opened {
+        eprintln!("could not open a browser ({e}) — open {url} yourself");
+    }
+}
+
+/// Print the error and exit — but on a Windows double-click, hold the console
+/// first: exiting straight away closes the window before the message can be
+/// read, which reads as "the program does nothing".
+fn die(code: i32, msg: &str) -> ! {
+    eprintln!("{msg}");
+    #[cfg(windows)]
+    if console_is_ours() {
+        eprintln!();
+        eprintln!("Press Enter to close this window...");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+    std::process::exit(code);
+}
+
+/// True when this process is the only one attached to its console — i.e. it
+/// was double-clicked, not run from a shell that survives it.
+#[cfg(windows)]
+fn console_is_ours() -> bool {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
+    }
+    let mut ids = [0u32; 2];
+    unsafe { GetConsoleProcessList(ids.as_mut_ptr(), 2) == 1 }
+}
+
+/// See-through-roof opacities: the values the instance behind this archive
+/// runs XaeroPlus with (its own defaults are 150 and 10).
+pub(crate) const ROOF_DEFAULT: xaero_core::render::RoofAlpha = xaero_core::render::RoofAlpha {
+    obsidian: 95,
+    snow: 10,
+};
 
 fn render_region_cmd(args: &[String]) {
     let mut input: Option<PathBuf> = None;
@@ -698,7 +759,8 @@ fn render_region_cmd(args: &[String]) {
                 i += 1;
                 output = PathBuf::from(&args[i]);
             }
-            "--cave" => opts.light_mode = LightMode::Multiply,
+            "--cave" => opts.cave_override = Some(i32::MIN),
+            "--roof" => opts.roof = Some(ROOF_DEFAULT),
             "--debug-missing" => opts.debug_missing = true,
             other => input = Some(PathBuf::from(other)),
         }

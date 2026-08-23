@@ -21,11 +21,12 @@ use axum::Router;
 use include_dir::{include_dir, Dir};
 use serde::Serialize;
 use xaero_core::naming::Dimension;
-use xaero_core::render::{ColorTable, LightMode, RenderOpts};
+use xaero_core::render::{ColorTable, RenderOpts};
 use xaero_core::waypoints::{parse_waypoints_file, waypoint_color_rgb};
 use xaero_scan::{index_regions, layer_dir, RegionIndex, World};
 
 pub mod config;
+mod highlights;
 mod ingest;
 mod live;
 mod preview;
@@ -35,10 +36,6 @@ static WEBUI: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../webui/dist");
 static COLORTABLE: &[u8] = include_bytes!("../../../assets/colortable.bin");
 
 const TILE: usize = 512;
-/// Most regions a zoomed-out tile may *decode from scratch* for one request.
-/// Regions whose thumbnail is already cached do not count against it, so a
-/// warmed pyramid keeps serving real imagery far past this many regions.
-const COMPOSE_REGION_CAP: usize = 4096;
 /// Edge of a cached per-region thumbnail. 32px is the cell size at z=-4, so
 /// every zoom from -4 outwards composes by downscaling thumbnails instead of
 /// decoding regions. Deliberately keyed by the region's mtime rather than the
@@ -70,7 +67,7 @@ const WARM_CHUNK: usize = 256;
 /// Regions per side of a spatial bucket. Zoomed-out tiles are power-of-two
 /// aligned, so a tile either sits inside one bucket or spans whole buckets —
 /// either way the lookup is O(regions in range), never O(regions in map).
-const BUCKET: i32 = 64;
+pub(crate) const BUCKET: i32 = 64;
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -139,6 +136,11 @@ struct MapId {
     dim: usize,
     mw: usize,
     cave: Option<i32>,
+    /// See-through-roof opacities (obsidian, snow) when the viewer asked for
+    /// that view. Part of the map's identity because it is different imagery
+    /// of the same regions: every tile, thumbnail and store row keys on it,
+    /// so the two views cannot be served for one another.
+    roof: Option<(u8, u8)>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -244,6 +246,14 @@ pub struct AppState {
     /// for the same expensive tile repeatedly; without this every request
     /// re-renders it in parallel and they all burn cores for one answer.
     inflight: Mutex<HashMap<TileKey, Arc<TileSlot>>>,
+    /// Region indexes currently being built, so the first zoomed-out view
+    /// (six concurrent tile requests) runs one full-folder scan, not six.
+    index_inflight: Mutex<HashMap<MapId, Arc<IndexSlot>>>,
+    /// Store-write count as of the last bbox prefetch, per prefetch key.
+    /// A repeat prefetch with an unchanged count is skipped — during a warm-up
+    /// every re-fetch of a deep tile used to re-materialize the same
+    /// (potentially huge) bbox from pyramid.db.
+    prefetched: Mutex<HashMap<PrefetchKey, u64>>,
     /// Background pyramid warm-up queue: one worker thread, newest request
     /// first, so the zoom level being looked at right now is always the next
     /// thing rendered and a busy worker never makes a view lose its turn.
@@ -295,11 +305,14 @@ struct MapCache {
     buckets: Arc<RegionBuckets>,
 }
 
+/// One bbox prefetch's identity: layer dir, tile origin, span, thumb tier.
+type PrefetchKey = (String, i64, i64, i64, bool);
+
 /// Regions grouped by BUCKET-sized grid cell.
-type RegionBuckets = HashMap<(i32, i32), Vec<(i32, i32)>>;
+pub(crate) type RegionBuckets = HashMap<(i32, i32), Vec<(i32, i32)>>;
 
 /// Buckets every indexed region by its BUCKET-sized grid cell.
-fn build_buckets(index: &RegionIndex) -> RegionBuckets {
+pub(crate) fn build_buckets(index: &RegionIndex) -> RegionBuckets {
     let mut out: RegionBuckets = HashMap::new();
     for &(rx, rz) in index.entries.keys() {
         out.entry((rx.div_euclid(BUCKET), rz.div_euclid(BUCKET)))
@@ -705,6 +718,8 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
         stale_stamps: Mutex::new(HashMap::new()),
         unreadable: Mutex::new(VecDeque::new()),
         inflight: Mutex::new(HashMap::new()),
+        index_inflight: Mutex::new(HashMap::new()),
+        prefetched: Mutex::new(HashMap::new()),
         warm: WarmQueue {
             jobs: Mutex::new(VecDeque::new()),
             running: AtomicBool::new(false),
@@ -787,6 +802,12 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
             "/ingest/v1/region",
             post(ingest::ingest_region).layer(axum::extract::DefaultBodyLimit::max(
                 ingest::REGION_BODY_MAX,
+            )),
+        )
+        .route(
+            "/ingest/v1/highlights",
+            post(highlights::ingest_highlights).layer(axum::extract::DefaultBodyLimit::max(
+                highlights::HIGHLIGHT_BODY_MAX,
             )),
         )
         .route(
@@ -916,10 +937,14 @@ pub(crate) async fn rescan_roots(st: &Arc<AppState>) {
     st.dbs.lock().unwrap().clear();
     st.tiles.lock().unwrap().clear();
     // MapId is positional: stale-imagery stamps from the old world list must
-    // not resolve against the new one. The thumbnail tiers survive — their
-    // keys carry the layer's identity through the region mtime and are only
-    // reached through the freshly rebuilt indexes.
+    // not resolve against the new one. The thumbnail tiers are positional too
+    // — an mtime collision across reordered worlds (copied archives preserve
+    // mtimes) would paint the wrong world's imagery — and re-warming from the
+    // pyramid store is cheap, so they go as well.
     st.stale_stamps.lock().unwrap().clear();
+    st.thumbs.lock().unwrap().clear();
+    st.mips.lock().unwrap().clear();
+    st.prefetched.lock().unwrap().clear();
     st.generation.fetch_add(1, Ordering::Relaxed);
     if st.watcher.lock().unwrap().is_some() {
         start_watching(st, false);
@@ -1270,9 +1295,11 @@ async fn api_fs_list(State(st): State<Arc<AppState>>, Query(q): Query<FsListQuer
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| !n.starts_with('.'))
         .collect();
-    dirs.sort_by_key(|a| a.to_lowercase());
+    // Dot-directories must be listed: the folder this browser exists to find
+    // is `.minecraft` on every platform. They sort last so the noise of a
+    // home directory's dotfiles stays out of the way.
+    dirs.sort_by_key(|a| (a.starts_with('.'), a.to_lowercase()));
     axum::Json(serde_json::json!({
         "path": path.display().to_string(),
         "parent": path.parent().map(|p| p.display().to_string()),
@@ -1347,7 +1374,10 @@ mod auth {
             if req.method() == axum::http::Method::POST
                 && matches!(
                     req.uri().path(),
-                    "/ingest/v1/position" | "/ingest/v1/region" | "/ingest/v1/preview"
+                    "/ingest/v1/position"
+                        | "/ingest/v1/region"
+                        | "/ingest/v1/preview"
+                        | "/ingest/v1/highlights"
                 )
             {
                 return next.run(req).await;
@@ -1935,9 +1965,26 @@ fn parse_layer(layer: &str) -> Option<Option<i32>> {
     layer.strip_prefix("cave-")?.parse().ok().map(Some)
 }
 
+/// Query of a tile request. `v` is the live updater's cache-buster and is
+/// deliberately ignored here; `roof` selects the see-through-roof view.
+#[derive(serde::Deserialize)]
+struct TileQuery {
+    #[serde(default)]
+    roof: Option<String>,
+}
+
+/// `roof=<obsidian>,<snow>`, each 0..=255. Anything else is ignored rather
+/// than refused: a tile request is not the place to argue about a query.
+fn parse_roof(q: &TileQuery) -> Option<(u8, u8)> {
+    let raw = q.roof.as_deref()?;
+    let (o, s) = raw.split_once(',')?;
+    Some((o.trim().parse().ok()?, s.trim().parse().ok()?))
+}
+
 async fn tile(
     State(st): State<Arc<AppState>>,
     headers: header::HeaderMap,
+    Query(q): Query<TileQuery>,
     AxPath((w, d, m, layer, z, x, y)): AxPath<(usize, usize, usize, String, i32, i32, i32)>,
 ) -> Response {
     let Some(cave) = parse_layer(&layer) else {
@@ -1948,26 +1995,27 @@ async fn tile(
         dim: d,
         mw: m,
         cave,
+        roof: parse_roof(&q),
     };
     if !(-16..=0).contains(&z) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let result = tokio::task::spawn_blocking(move || tile_blocking(&st, map, z, x, y))
+    // Tiles are hundreds of KB and a pan re-requests most of the screen, so
+    // revalidation matters: the cache stamp (a region's mtime, or the map
+    // generation for composed tiles) is exactly the identity of the bytes,
+    // and a matching If-None-Match answers 304 *before* any rendering.
+    let inm: Option<String> = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let result = tokio::task::spawn_blocking(move || tile_blocking(&st, map, z, x, y, inm))
         .await
         .unwrap_or(Err("render task failed".into()));
     match result {
-        // Tiles are hundreds of KB and a pan re-requests most of the screen, so
-        // revalidation matters: the cache stamp (a region's mtime, or the map
-        // generation for composed tiles) is exactly the identity of the bytes.
-        Ok((tile, stamp)) => {
-            let etag = format!("\"{z}.{x}.{y}.{stamp}\"");
-            if headers
-                .get(header::IF_NONE_MATCH)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|v| v.split(',').any(|c| c.trim() == etag))
-            {
-                return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
-            }
+        Ok(TileResp::NotModified(etag)) => {
+            (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response()
+        }
+        Ok(TileResp::Full(tile, etag)) => {
             let body = match tile {
                 Some(png) => png.as_ref().clone(),
                 // A real transparent PNG, not 204: browsers render bodyless
@@ -1988,6 +2036,33 @@ async fn tile(
     }
 }
 
+/// What `tile_blocking` answers: a body with its ETag, or just the ETag when
+/// the client's If-None-Match already matches (no render happened).
+enum TileResp {
+    NotModified(String),
+    Full(EncodedTile, String),
+}
+
+/// The browser-facing tile identity. Besides the coordinates and content
+/// stamp it carries the layer directory's hash: MapIds are positional, so
+/// after a roots change the same URL can point at a different world — an
+/// mtime collision must not let a stale browser entry revalidate.
+fn tile_etag(dir_hash: u64, z: i32, x: i32, y: i32, stamp: u64) -> String {
+    format!("\"{z}.{x}.{y}.{stamp}.{dir_hash:x}\"")
+}
+
+fn inm_matches(inm: &Option<String>, etag: &str) -> bool {
+    inm.as_deref()
+        .is_some_and(|v| v.split(',').any(|c| c.trim() == etag))
+}
+
+fn hash_path(p: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    p.hash(&mut h);
+    h.finish()
+}
+
 /// Full-size fully transparent tile, encoded once. Full-size (not a stretched
 /// 1x1) so browsers never draw scaling/outline artifacts for empty areas.
 fn empty_tile_png() -> &'static [u8] {
@@ -2001,10 +2076,68 @@ type IndexHandle = (
     Arc<HashMap<(i32, i32), Vec<(i32, i32)>>>,
 );
 
+/// A region-index build in progress; later requests for the same map wait on
+/// it instead of scanning the same million-file folder in parallel.
+struct IndexSlot {
+    done: Mutex<bool>,
+    ready: std::sync::Condvar,
+}
+
 fn get_index(st: &AppState, map: &MapId) -> Result<IndexHandle, String> {
-    if let Some(cache) = st.indexes.read().unwrap().get(map) {
-        return Ok((cache.index.clone(), cache.gen, cache.buckets.clone()));
+    loop {
+        if let Some(cache) = st.indexes.read().unwrap().get(map) {
+            return Ok((cache.index.clone(), cache.gen, cache.buckets.clone()));
+        }
+        let waiter = {
+            let mut infl = st.index_inflight.lock().unwrap();
+            match infl.get(map) {
+                Some(slot) => Some(slot.clone()),
+                None => {
+                    infl.insert(
+                        map.clone(),
+                        Arc::new(IndexSlot {
+                            done: Mutex::new(false),
+                            ready: std::sync::Condvar::new(),
+                        }),
+                    );
+                    None
+                }
+            }
+        };
+        match waiter {
+            Some(slot) => {
+                // Follower: wait for the leader, then re-check the cache. If
+                // the leader failed, the loop makes this request the next
+                // leader and the error (if persistent) surfaces here too.
+                let mut done = slot.done.lock().unwrap();
+                while !*done {
+                    done = slot.ready.wait(done).unwrap();
+                }
+                continue;
+            }
+            None => {
+                // Leader. The guard releases waiters even if the build panics.
+                struct Release<'a> {
+                    st: &'a AppState,
+                    map: &'a MapId,
+                }
+                impl Drop for Release<'_> {
+                    fn drop(&mut self) {
+                        if let Some(slot) = self.st.index_inflight.lock().unwrap().remove(self.map)
+                        {
+                            *slot.done.lock().unwrap() = true;
+                            slot.ready.notify_all();
+                        }
+                    }
+                }
+                let _release = Release { st, map };
+                return build_index(st, map);
+            }
+        }
     }
+}
+
+fn build_index(st: &AppState, map: &MapId) -> Result<IndexHandle, String> {
     let worlds = st.worlds.read().unwrap().clone();
     let we = worlds.get(map.world).ok_or("no such world")?;
     let dim = we.world.dims.get(map.dim).ok_or("no such dimension")?;
@@ -2068,7 +2201,8 @@ fn tile_blocking(
     z: i32,
     x: i32,
     y: i32,
-) -> Result<(EncodedTile, u64), String> {
+    inm: Option<String>,
+) -> Result<TileResp, String> {
     // A native tile is one region, and its filename is derivable from the tile
     // coordinates, so it does not need the region index at all. Building that
     // index means stat()ing every file in the folder — 1M+ on a real 2b2t
@@ -2084,17 +2218,33 @@ fn tile_blocking(
             .map(|c| c.index.clone());
         let (dir, meta) = match &indexed {
             Some(index) => match index.entries.get(&(x, y)) {
-                None => return Ok((None, 0)),
+                None => {
+                    let etag = tile_etag(hash_path(&index.dir), z, x, y, 0);
+                    if inm_matches(&inm, &etag) {
+                        return Ok(TileResp::NotModified(etag));
+                    }
+                    return Ok(TileResp::Full(None, etag));
+                }
                 Some(meta) => (index.dir.clone(), *meta),
             },
             None => {
                 let dir = layer_dir_for(st, &map)?;
                 match live::stat_region(&dir, x, y) {
-                    None => return Ok((None, 0)),
+                    None => {
+                        let etag = tile_etag(hash_path(&dir), z, x, y, 0);
+                        if inm_matches(&inm, &etag) {
+                            return Ok(TileResp::NotModified(etag));
+                        }
+                        return Ok(TileResp::Full(None, etag));
+                    }
                     Some(meta) => (dir, meta),
                 }
             }
         };
+        let etag = tile_etag(hash_path(&dir), z, x, y, meta.mtime_ms);
+        if inm_matches(&inm, &etag) {
+            return Ok(TileResp::NotModified(etag));
+        }
         let key = TileKey {
             map: map.clone(),
             db: None,
@@ -2104,7 +2254,7 @@ fn tile_blocking(
             stamp: meta.mtime_ms,
         };
         if let Some(hit) = st.tiles.lock().unwrap().get(&key) {
-            return Ok((hit.clone(), meta.mtime_ms));
+            return Ok(TileResp::Full(hit.clone(), etag));
         }
         let path = dir.join(format!(
             "{x}_{y}.{}",
@@ -2125,11 +2275,36 @@ fn tile_blocking(
                 .unwrap()
                 .put(key.clone(), encoded.clone(), size);
             Ok((encoded, meta.mtime_ms))
-        });
+        })
+        .map(|(tile, _)| TileResp::Full(tile, etag));
     }
 
     let (index, gen, buckets) = get_index(st, &map)?;
-    let stamp = gen;
+    let dir_hash = hash_path(&index.dir);
+    // Mid-zoom tiles decode every covered region on each compose, and their
+    // content depends only on those regions — never on cache warmth (the cold
+    // budget can't be exceeded at <= 64 regions). Stamping them by the
+    // covered regions instead of the map generation keeps them cached (and
+    // lets browsers revalidate) across the generation bumps that live play
+    // and warm-up produce for unrelated areas.
+    let span = 1i64 << (-z);
+    let full_tier = (TILE >> (-z)) > THUMB;
+    let stamp = if full_tier {
+        let in_range = regions_in_range(&index, &buckets, x as i64 * span, y as i64 * span, span);
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        in_range.len().hash(&mut h);
+        for &((rx, rz), mtime) in &in_range {
+            (rx, rz, mtime).hash(&mut h);
+        }
+        h.finish()
+    } else {
+        gen
+    };
+    let etag = tile_etag(dir_hash, z, x, y, stamp);
+    if inm_matches(&inm, &etag) {
+        return Ok(TileResp::NotModified(etag));
+    }
     let key = TileKey {
         map: map.clone(),
         db: None,
@@ -2139,7 +2314,7 @@ fn tile_blocking(
         stamp,
     };
     if let Some(hit) = st.tiles.lock().unwrap().get(&key) {
-        return Ok((hit.clone(), stamp));
+        return Ok(TileResp::Full(hit.clone(), etag));
     }
     single_flight(st, &key, || {
         // A zoomed-out tile is the expensive kind, so re-check the cache: the
@@ -2169,6 +2344,7 @@ fn tile_blocking(
         }
         Ok((encoded, stamp))
     })
+    .map(|(tile, _)| TileResp::Full(tile, etag))
 }
 
 /// What an overzoom compose produced.
@@ -2194,11 +2370,18 @@ enum Tier {
     Full,
 }
 
-/// Regions whose tier source is not already in RAM (each costs a decode —
-/// or a store read after `prefetch_store`).
-fn count_cold(st: &AppState, map: &MapId, in_range: &[((i32, i32), u64)], tier: Tier) -> usize {
+/// The subset of `in_range` whose tier source is not already in RAM (each
+/// costs a decode — or a store read after `prefetch_store`). Returning the
+/// regions themselves lets the warm queue work on exactly these instead of an
+/// arbitrary prefix of the range, which is what makes warm-up converge.
+fn cold_regions(
+    st: &AppState,
+    map: &MapId,
+    in_range: &[((i32, i32), u64)],
+    tier: Tier,
+) -> Vec<((i32, i32), u64)> {
     match tier {
-        Tier::Full => in_range.len(),
+        Tier::Full => in_range.to_vec(),
         Tier::Thumb => {
             let mut thumbs = st.thumbs.lock().unwrap();
             in_range
@@ -2206,23 +2389,43 @@ fn count_cold(st: &AppState, map: &MapId, in_range: &[((i32, i32), u64)], tier: 
                 .filter(|&&((rx, rz), mtime_ms)| {
                     thumbs.get(&thumb_key(map, rx, rz, mtime_ms)).is_none()
                 })
-                .count()
+                .copied()
+                .collect()
         }
         Tier::Mip => {
             // A 32px thumbnail in RAM counts as warm too: deriving the 8px
             // mip from it is a downscale, not a decode.
-            let mut mips = st.mips.lock().unwrap();
-            let mut cold: Vec<ThumbKey> = Vec::new();
-            for &((rx, rz), mtime_ms) in in_range {
-                let key = thumb_key(map, rx, rz, mtime_ms);
-                if mips.get(&key).is_none() {
-                    cold.push(key);
-                }
-            }
-            drop(mips);
+            let mut cold: Vec<((i32, i32), u64)> = {
+                let mut mips = st.mips.lock().unwrap();
+                in_range
+                    .iter()
+                    .filter(|&&((rx, rz), mtime_ms)| {
+                        mips.get(&thumb_key(map, rx, rz, mtime_ms)).is_none()
+                    })
+                    .copied()
+                    .collect()
+            };
             let mut thumbs = st.thumbs.lock().unwrap();
-            cold.into_iter().filter(|k| thumbs.get(k).is_none()).count()
+            cold.retain(|&((rx, rz), mtime_ms)| {
+                thumbs.get(&thumb_key(map, rx, rz, mtime_ms)).is_none()
+            });
+            cold
         }
+    }
+}
+
+/// The thumbnail store's key for a layer directory. A see-through-roof view
+/// is different imagery of the same regions, so it gets its own rows instead
+/// of overwriting the plain ones. The separator is a control character, which
+/// no real path carries.
+fn store_dir(index: &RegionIndex, map: &MapId) -> String {
+    /// No real path carries a control character, so a variant can never be
+    /// confused with a directory that happens to be named like one.
+    const SEP: char = '\u{1}';
+    let dir = index.dir.display().to_string();
+    match map.roof {
+        Some((o, s)) => format!("{dir}{SEP}roof{o},{s}"),
+        None => dir,
     }
 }
 
@@ -2253,7 +2456,21 @@ fn prefetch_store(
     };
     let rx1 = i32::try_from(x0 + span - 1).unwrap_or(i32::MAX);
     let rz1 = i32::try_from(y0 + span - 1).unwrap_or(i32::MAX);
-    let dir = index.dir.display().to_string();
+    let dir = store_dir(index, map);
+    // A deep tile's bbox can cover most of the store; loading it again when
+    // nothing has been written since the last time cannot find anything new.
+    let pf_key = (dir.clone(), x0, y0, span, tier == Tier::Thumb);
+    let writes_now = store.writes();
+    {
+        let mut seen = st.prefetched.lock().unwrap();
+        if seen.get(&pf_key) == Some(&writes_now) {
+            return;
+        }
+        if seen.len() > 4096 {
+            seen.clear();
+        }
+        seen.insert(pf_key, writes_now);
+    }
     let rows = store.load_bbox(&dir, rx0, rz0, rx1, rz1, tier == Tier::Thumb);
     if rows.is_empty() {
         return;
@@ -2337,45 +2554,91 @@ fn tile_rgba(
         return Ok(Composed::Empty);
     }
 
-    // Real imagery for as long as a region still gets a pixel and the work is
-    // affordable. Regions whose thumbnail is already cached (RAM, or the
-    // persistent store after a prefetch) are nearly free, so only the ones
-    // that still need decoding count against the budget: a warmed pyramid
-    // keeps drawing imagery at zoom levels a cold one cannot afford.
+    // Real imagery for as long as the work is affordable. Regions whose
+    // thumbnail is already cached (RAM, or the persistent store after a
+    // prefetch) are nearly free, so only the ones that still need decoding
+    // count against the budget: a warmed pyramid keeps drawing imagery at
+    // zoom levels a cold one cannot afford. `cell == 0` (a region smaller
+    // than a pixel) composes sub-pixel from the mip tier — the whole-archive
+    // zooms must show real terrain colors, not just coverage rectangles.
     let cell = if -z < 10 { TILE >> (-z) } else { 0 };
-    if cell >= 1 {
-        let tier = if cell <= MIP {
+    {
+        let tier = if cell == 0 || cell <= MIP {
             Tier::Mip
         } else if cell <= THUMB {
             Tier::Thumb
         } else {
             Tier::Full
         };
-        let mut cold = count_cold(st, map, &in_range, tier);
-        if cold > 0 && tier != Tier::Full {
+        let mut cold = cold_regions(st, map, &in_range, tier);
+        // A bbox prefetch is one big query; worth it only when the compose
+        // would otherwise be refused. Small cold sets are served by the
+        // per-region store lookups inside the compose itself.
+        if cold.len() > WARM_SYNC_BUDGET && tier != Tier::Full {
             prefetch_store(st, index, map, x0, y0, span, tier);
-            cold = count_cold(st, map, &in_range, tier);
+            cold = cold_regions(st, map, &cold, tier);
         }
         // Decoding thousands of cold regions inline means a viewer staring at
         // nothing for a minute. Past the synchronous budget, answer now — with
         // the tile's previous imagery if it is still cached, else coverage
         // rectangles — and build the thumbnails in the background; the live
         // socket tells the viewer to re-fetch once they exist.
-        if cold > WARM_SYNC_BUDGET {
-            schedule_warm(st, map, &in_range);
+        if cold.len() > WARM_SYNC_BUDGET {
+            schedule_warm(st, map, &cold);
             if let Some(png) = stale_tile(st, map, z, x, y) {
                 return Ok(Composed::Stale(png));
             }
-        } else if cold <= COMPOSE_REGION_CAP {
-            let opts = RenderOpts {
-                light_mode: if map.cave.is_some() {
-                    LightMode::Multiply
-                } else {
-                    LightMode::Ignore
-                },
-                ..Default::default()
-            };
+        } else {
+            let opts = render_opts_for(st, map);
             use rayon::prelude::*;
+            if cell == 0 {
+                // Sub-pixel: average each region's mip to one color and
+                // accumulate it (alpha-weighted) into its output pixel.
+                let regions_per_px = ((span as usize) / TILE) * ((span as usize) / TILE);
+                let dots: Vec<(usize, [f32; 4])> = in_range
+                    .par_iter()
+                    .filter_map(|&((rx, rz), mtime_ms)| {
+                        let mip = region_mip(st, index, map, rx, rz, mtime_ms, &opts)?;
+                        let (mut r, mut g, mut b, mut a) = (0f32, 0f32, 0f32, 0f32);
+                        for i in (0..mip.len()).step_by(4) {
+                            let al = mip[i + 3] as f32 / 255.0;
+                            r += mip[i] as f32 * al;
+                            g += mip[i + 1] as f32 * al;
+                            b += mip[i + 2] as f32 * al;
+                            a += al;
+                        }
+                        if a <= 0.0 {
+                            return None;
+                        }
+                        let px_x = ((rx as i64 - x0) as usize * TILE) / span as usize;
+                        let px_y = ((rz as i64 - y0) as usize * TILE) / span as usize;
+                        Some((px_y * TILE + px_x, [r, g, b, a]))
+                    })
+                    .collect();
+                let mut acc = vec![0f32; TILE * TILE * 4];
+                for (i, [r, g, b, a]) in dots {
+                    acc[i * 4] += r;
+                    acc[i * 4 + 1] += g;
+                    acc[i * 4 + 2] += b;
+                    acc[i * 4 + 3] += a;
+                }
+                let mut out = vec![0u8; TILE * TILE * 4];
+                let full = (MIP * MIP) as f32; // per-region alpha sum of a fully opaque mip
+                for i in 0..TILE * TILE {
+                    let a = acc[i * 4 + 3];
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    out[i * 4] = (acc[i * 4] / a).min(255.0) as u8;
+                    out[i * 4 + 1] = (acc[i * 4 + 1] / a).min(255.0) as u8;
+                    out[i * 4 + 2] = (acc[i * 4 + 2] / a).min(255.0) as u8;
+                    // Coverage: how much of the pixel's region slots hold
+                    // opaque terrain. Sparse exploration stays translucent.
+                    let coverage = a / (full * regions_per_px as f32);
+                    out[i * 4 + 3] = (coverage.min(1.0) * 255.0).max(64.0) as u8;
+                }
+                return Ok(Composed::Imagery(out));
+            }
             let cells: Vec<((usize, usize), Vec<u8>)> = in_range
                 .par_iter()
                 .filter_map(|&((rx, rz), mtime_ms)| {
@@ -2449,6 +2712,30 @@ fn tile_rgba(
     Ok(Composed::Rects(out))
 }
 
+/// Render options for one map layer: nether-type dimensions get their ambient
+/// light and logical height, and the selected cave layer forces every tile's
+/// cave mode so legacy tiles without a stored value follow the layer they sit
+/// in. Falls back to overworld defaults when the map cannot be resolved.
+fn render_opts_for(st: &AppState, map: &MapId) -> RenderOpts {
+    let mut opts = RenderOpts {
+        cave_override: map.cave,
+        roof: map
+            .roof
+            .map(|(obsidian, snow)| xaero_core::render::RoofAlpha { obsidian, snow }),
+        ..Default::default()
+    };
+    let worlds = st.worlds.read().unwrap().clone();
+    let nether = worlds
+        .get(map.world)
+        .and_then(|we| we.world.dims.get(map.dim))
+        .is_some_and(|dim| dim.dimension_type() == Some(Dimension::Nether));
+    if nether {
+        opts.dim_ambient = 0.1;
+        opts.logical_height = 128;
+    }
+    opts
+}
+
 /// The on-disk folder holding a map's region files, without touching (or
 /// building) the region index.
 fn layer_dir_for(st: &AppState, map: &MapId) -> Result<PathBuf, String> {
@@ -2493,14 +2780,7 @@ fn render_native(
             &format!("truncated region ({} bytes unread)", dec.trailing),
         );
     }
-    let opts = RenderOpts {
-        light_mode: if map.cave.is_some() {
-            LightMode::Multiply
-        } else {
-            LightMode::Ignore
-        },
-        ..Default::default()
-    };
+    let opts = render_opts_for(st, map);
     Ok(Some(xaero_core::render::render_region(&dec, &st.ct, &opts)))
 }
 
@@ -2587,16 +2867,33 @@ struct WarmJob {
 /// looked at right now always warms before areas the viewer already left, and
 /// a request that arrives while the worker is busy queues instead of being
 /// dropped. One worker thread total, so a 1M-region archive can never have a
-/// job per pan all competing for the same cores.
-fn schedule_warm(st: &Arc<AppState>, map: &MapId, in_range: &[((i32, i32), u64)]) {
+/// job per pan all competing for the same cores. Callers pass only regions
+/// that are actually cold, and coordinates already queued for the map are not
+/// queued twice — every job makes real progress, so warm-up converges.
+fn schedule_warm(st: &Arc<AppState>, map: &MapId, cold: &[((i32, i32), u64)]) {
     {
         let mut jobs = st.warm.jobs.lock().unwrap();
-        jobs.push_front(WarmJob {
-            map: map.clone(),
-            work: in_range.iter().take(WARM_JOB_CAP).copied().collect(),
-        });
-        while jobs.len() > WARM_QUEUE_CAP {
-            jobs.pop_back(); // the oldest view loses its slot, never the newest
+        let queued: std::collections::HashSet<(i32, i32)> = jobs
+            .iter()
+            .filter(|j| j.map == *map)
+            .flat_map(|j| j.work.iter().map(|w| w.0))
+            .collect();
+        let work: Vec<((i32, i32), u64)> = cold
+            .iter()
+            .filter(|w| !queued.contains(&w.0))
+            .take(WARM_JOB_CAP)
+            .copied()
+            .collect();
+        if !work.is_empty() {
+            jobs.push_front(WarmJob {
+                map: map.clone(),
+                work,
+            });
+            while jobs.len() > WARM_QUEUE_CAP {
+                jobs.pop_back(); // the oldest view loses its slot, never the newest
+            }
+        } else if jobs.is_empty() {
+            return; // nothing new and nothing queued: no worker needed
         }
     }
     if st
@@ -2660,14 +2957,7 @@ fn warm_job(st: &Arc<AppState>, job: WarmJob) {
     let Ok((index, _, _)) = get_index(st, &job.map) else {
         return;
     };
-    let opts = RenderOpts {
-        light_mode: if job.map.cave.is_some() {
-            LightMode::Multiply
-        } else {
-            LightMode::Ignore
-        },
-        ..Default::default()
-    };
+    let opts = render_opts_for(st, &job.map);
     use rayon::prelude::*;
     let mut rest = job.work.as_slice();
     while !rest.is_empty() {
@@ -2855,7 +3145,7 @@ fn region_thumb(
         return Some(hit.clone());
     }
     if let Some(store) = &st.pyramid {
-        let dir = index.dir.display().to_string();
+        let dir = store_dir(index, map);
         if let Some((t32, t8)) = store.load_one(&dir, rx, rz, mtime_ms) {
             if t32.len() == THUMB * THUMB * 4 && t8.len() == MIP * MIP * 4 {
                 let thumb = Arc::new(t32);
@@ -2879,7 +3169,7 @@ fn region_thumb(
     st.mips.lock().unwrap().put(key, mip.clone(), mip.len());
     if let Some(store) = &st.pyramid {
         store.put(pyramid::ThumbRow {
-            dir: index.dir.display().to_string(),
+            dir: store_dir(index, map),
             rx,
             rz,
             mtime_ms,
@@ -2960,32 +3250,39 @@ const HL_ALPHA: u8 = 110;
 
 async fn highlight_tile(
     State(st): State<Arc<AppState>>,
+    headers: header::HeaderMap,
     AxPath((w, db, d, z, x, y)): AxPath<(usize, String, usize, i32, i32, i32)>,
 ) -> Response {
     if !(-16..=0).contains(&z) || db.contains('/') || db.contains('\\') || !db.ends_with(".db") {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let inm: Option<String> = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     let result =
-        tokio::task::spawn_blocking(move || highlight_tile_blocking(&st, w, &db, d, z, x, y))
+        tokio::task::spawn_blocking(move || highlight_tile_blocking(&st, w, &db, d, z, x, y, inm))
             .await
             .unwrap_or(Err("render task failed".into()));
     match result {
-        Ok(Some(png)) => (
-            [
-                (header::CONTENT_TYPE, "image/png"),
-                (header::CACHE_CONTROL, "no-cache"),
-            ],
-            png.as_ref().clone(),
-        )
-            .into_response(),
-        Ok(None) => (
-            [
-                (header::CONTENT_TYPE, "image/png"),
-                (header::CACHE_CONTROL, "no-cache"),
-            ],
-            empty_tile_png().to_vec(),
-        )
-            .into_response(),
+        Ok(TileResp::NotModified(etag)) => {
+            (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response()
+        }
+        Ok(TileResp::Full(tile, etag)) => {
+            let body = match tile {
+                Some(png) => png.as_ref().clone(),
+                None => empty_tile_png().to_vec(),
+            };
+            (
+                [
+                    (header::CONTENT_TYPE, "image/png".to_string()),
+                    (header::CACHE_CONTROL, "no-cache".to_string()),
+                    (header::ETAG, etag),
+                ],
+                body,
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -3014,6 +3311,7 @@ fn get_db(st: &AppState, w: usize, db_name: &str) -> Result<(SharedDb, u64), Str
     Ok((db, mtime))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn highlight_tile_blocking(
     st: &AppState,
     w: usize,
@@ -3022,7 +3320,8 @@ fn highlight_tile_blocking(
     z: i32,
     x: i32,
     y: i32,
-) -> Result<EncodedTile, String> {
+    inm: Option<String>,
+) -> Result<TileResp, String> {
     let worlds = st.worlds.read().unwrap().clone();
     let we = worlds.get(w).ok_or("no such world")?;
     let dim = we.world.dims.get(d).ok_or("no such dimension")?;
@@ -3033,12 +3332,26 @@ fn highlight_tile_blocking(
         .ok_or("dimension has no resource key")?;
 
     let (db, mtime) = get_db(st, w, db_name)?;
+    // The db path hash keeps a positional world index from revalidating
+    // another world's overlay after a roots change; the dim index is in the
+    // hash input because the same db serves several dimensions.
+    let dir_hash = we
+        .world
+        .world_map_path
+        .as_ref()
+        .map(|wm| hash_path(&wm.join(db_name).join(d.to_string())))
+        .unwrap_or(0);
+    let etag = tile_etag(dir_hash, z, x, y, mtime);
+    if inm_matches(&inm, &etag) {
+        return Ok(TileResp::NotModified(etag));
+    }
     let key = TileKey {
         map: MapId {
             world: w,
             dim: d,
             mw: 0,
             cave: None,
+            roof: None,
         },
         db: Some(db_name.to_string()),
         z,
@@ -3047,7 +3360,7 @@ fn highlight_tile_blocking(
         stamp: mtime,
     };
     if let Some(hit) = st.tiles.lock().unwrap().get(&key) {
-        return Ok(hit.clone());
+        return Ok(TileResp::Full(hit.clone(), etag));
     }
 
     // Tile spans 2^-z regions = 2^-z * 32 chunks per axis.
@@ -3112,7 +3425,7 @@ fn highlight_tile_blocking(
     };
     let size = encoded.as_ref().map(|p| p.len()).unwrap_or(0) + 64;
     st.tiles.lock().unwrap().put(key, encoded.clone(), size);
-    Ok(encoded)
+    Ok(TileResp::Full(encoded, etag))
 }
 
 fn now_ms() -> u64 {

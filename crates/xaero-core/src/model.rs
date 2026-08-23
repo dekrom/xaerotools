@@ -102,6 +102,15 @@ impl Overlay {
     pub fn opacity(&self) -> u8 {
         ((self.params >> 11) & 15) as u8
     }
+    /// Opacity as the renderer must see it: the legacy i32 when the file
+    /// carried one (the decoder fills it for every legacy overlay), else the
+    /// packed 4-bit field.
+    pub fn effective_opacity(&self) -> i32 {
+        match self.legacy_opacity {
+            Some(v) => v,
+            None => ((self.params >> 11) & 15) as i32,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -685,3 +685,93 @@ button:hover {
   font-size: 11px;
   margin-top: 4px;
 }
+
+/* ---------------------------------------------------------- first-run card */
+
+.welcome {
+  position: fixed;
+  inset: 0;
+  overflow-y: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+}
+
+.welcome-card {
+  width: min(560px, calc(100vw - 32px));
+  margin: 24px 0;
+  padding: 24px 28px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.welcome-card h1 {
+  margin: 0 0 8px;
+  font-size: 22px;
+}
+
+.welcome-card p {
+  color: var(--fg-dim);
+  line-height: 1.45;
+}
+
+.welcome-row {
+  display: flex;
+  gap: 8px;
+}
+
+.welcome-row input {
+  flex: 1;
+  padding: 6px 8px;
+  color: var(--fg);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.welcome-row button {
+  padding: 6px 14px;
+  color: var(--fg);
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+#welcome-status {
+  min-height: 1.2em;
+  color: var(--fg);
+}
+
+.welcome-fs {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg3);
+}
+
+#welcome-fs-path {
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+  word-break: break-all;
+}
+
+#welcome-fs-list {
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+#welcome-fs-list li {
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+#welcome-fs-list li:hover {
+  background: var(--bg2);
+}

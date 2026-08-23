@@ -60,9 +60,21 @@ let guideLayer = L.layerGroup();
 let gridLayer: L.GridLayer | null = null;
 let waypointFiles: WaypointFileJson[] = [];
 let wpFilter = '';
+/** Bumped per reloadWaypoints call so a slow response for one world cannot
+ *  land after a switch and paint that world's waypoints on another. */
+let wpReloadGen = 0;
 let hlLayers = new Map<string, L.TileLayer>(); // db filename -> active layer
 let hlEnabled = new Set<string>(); // persists across dim/world switches
 let netherUnderlay: L.TileLayer | null = null;
+let measure: { points: { x: number; z: number }[]; line: L.Polyline | null } | null = null;
+/** While a popup is open, marker rebuilds are deferred: clearing a marker's
+ *  layer closes its popup, and popup auto-pan itself fires the very moveend
+ *  that triggers the rebuild — opening one would close it instantly. */
+let popupOpen = false;
+/** Waypoint picked in the sidebar whose popup should open once its marker
+ *  exists (the setView pan rebuilds markers before the popup can show). */
+let pendingWpPopup: string | null = null;
+const wpKey = (wp: WaypointJson) => `${wp.x},${wp.z},${wp.name}`;
 let atlasLayer = L.layerGroup();
 let atlasData: AtlasLocation[] | null = null;
 let atlasFilter = '';
@@ -119,8 +131,24 @@ function currentDim() {
   return currentWorld()?.dims[sel.d];
 }
 
+/** The see-through-roof query every map-tile layer carries, '' when off.
+ *  It is part of the tile's identity server-side, so both views cache and
+ *  refresh independently. */
+function roofQuery(): string {
+  const cb = $('toggle-roof') as HTMLInputElement | null;
+  if (!cb?.checked) return '';
+  return `?roof=${roofAlpha('roof-obsidian', 95)},${roofAlpha('roof-snow', 10)}`;
+}
+
+/** One roof opacity input, clamped to the byte the server accepts. */
+function roofAlpha(id: string, fallback: number): number {
+  const v = Number(($(id) as HTMLInputElement | null)?.value);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.max(0, Math.min(255, Math.round(v)));
+}
+
 function tileUrl(): string {
-  return `./tiles/${sel.w}/${sel.d}/${sel.m}/${sel.layer}/{z}/{x}/{y}`;
+  return `./tiles/${sel.w}/${sel.d}/${sel.m}/${sel.layer}/{z}/{x}/{y}${roofQuery()}`;
 }
 
 /** Tells same-named worlds from different roots apart: the ingest trees say
@@ -146,6 +174,13 @@ function readHash(): { sel: Selection; x: number; z: number; zoom: number } | nu
   for (const name of (params.get('hl') ?? '').split(',')) {
     if (name) hlEnabled.add(name.endsWith('.db') ? name : `XaeroPlus${name}.db`);
   }
+  const roof = params.get('roof');
+  if (roof) {
+    const [o, n] = roof.split(',');
+    ($('toggle-roof') as HTMLInputElement).checked = true;
+    if (o) ($('roof-obsidian') as HTMLInputElement).value = o;
+    if (n) ($('roof-snow') as HTMLInputElement).value = n;
+  }
   if (params.get('nether') === '1') ($('toggle-nether') as HTMLInputElement).checked = true;
   if (params.get('atlas') === '1') ($('toggle-atlas') as HTMLInputElement).checked = true;
   if (params.get('au') === '1') ($('toggle-atlas-under') as HTMLInputElement).checked = true;
@@ -166,6 +201,8 @@ function writeHash() {
   )}/${map.getZoom()}`;
   const params: string[] = [];
   if (hlEnabled.size > 0) params.push(`hl=${[...hlEnabled].map(hlLabel).join(',')}`);
+  const roofQ = roofQuery();
+  if (roofQ) params.push(roofQ.slice(1));
   if (($('toggle-nether') as HTMLInputElement)?.checked) params.push('nether=1');
   if (($('toggle-atlas') as HTMLInputElement)?.checked) params.push('atlas=1');
   if (($('toggle-atlas-under') as HTMLInputElement)?.checked) params.push('au=1');
@@ -184,6 +221,11 @@ function setupMap() {
     zoomControl: false,
     attributionControl: false,
     preferCanvas: false,
+    // Off, or every live region update flashes: refreshLayerTiles() swaps a
+    // loaded tile by re-assigning its src, which re-fires the load listener
+    // Leaflet bound in createTile, and its fade-in restarts from opacity 0.
+    // The map is blocky pixel art — the ramp buys nothing on pan/zoom either.
+    fadeAnimation: false,
   });
   // Top-left belongs to the toolbar; keep zoom out of the way of panels.
   L.control.zoom({ position: 'bottomright' }).addTo(map);
@@ -203,11 +245,31 @@ function setupMap() {
     }
     $('coords').textContent = `X: ${Math.floor(x)} Z: ${Math.floor(z)}${extra}`;
   });
+  map.on('click', (e: L.LeafletMouseEvent) => {
+    if (measure) measureAddPoint(fromLatLng(e.latlng));
+  });
   map.on('moveend zoomend', () => {
     writeHash();
     redrawGuides();
-    redrawWaypoints();
-    redrawAtlas();
+    if (!popupOpen) {
+      redrawWaypoints();
+      redrawAtlas();
+    }
+  });
+  map.on('popupopen', () => {
+    popupOpen = true;
+    pendingWpPopup = null;
+  });
+  map.on('popupclose', () => {
+    popupOpen = false;
+    // Deferred so that switching straight to another marker's popup (close A,
+    // open B) doesn't rebuild B's marker out from under the opening popup.
+    setTimeout(() => {
+      if (!popupOpen) {
+        redrawWaypoints();
+        redrawAtlas();
+      }
+    }, 0);
   });
   // Grabbing the map is the "stop following" gesture (panTo never fires this).
   map.on('dragstart', () => {
@@ -230,7 +292,9 @@ function updateNetherToggle() {
       ? 0
       : Math.min(sel.m, Math.max(0, (currentWorld()!.dims[netherIdx].mws.length ?? 1) - 1));
   const wantUrl =
-    !row.hidden && cb.checked ? `./tiles/${sel.w}/${netherIdx}/${mwIdx}/surface/{z}/{x}/{y}` : '';
+    !row.hidden && cb.checked
+      ? `./tiles/${sel.w}/${netherIdx}/${mwIdx}/surface/{z}/{x}/{y}${roofQuery()}`
+      : '';
   // Same source = keep the layer; rebuilding blanks it until tiles reload.
   if (wantUrl === netherUnderlayUrl) return;
   netherUnderlayUrl = wantUrl;
@@ -252,6 +316,7 @@ function updateNetherToggle() {
         minNativeZoom: -16,
         noWrap: true,
         errorTileUrl: TRANSPARENT_TILE,
+        className: 'pixelated',
         opacity: 0.75,
         zIndex: 1,
       }
@@ -259,6 +324,34 @@ function updateNetherToggle() {
     netherUnderlay.addTo(map);
     baseLayer?.setZIndex(2);
   }
+}
+
+// ----------------------------------------------------------------- measure --
+
+function measureAddPoint(p: { x: number; z: number }) {
+  if (!measure) return;
+  measure.points.push(p);
+  if (measure.line) map.removeLayer(measure.line);
+  measure.line = L.polyline(
+    measure.points.map((q) => toLatLng(q.x, q.z)),
+    { color: '#ffd35c', weight: 2, dashArray: '6 4' }
+  ).addTo(map);
+  let total = 0;
+  for (let i = 1; i < measure.points.length; i++) {
+    const a = measure.points[i - 1];
+    const b = measure.points[i];
+    total += Math.hypot(b.x - a.x, b.z - a.z);
+  }
+  const dimType = currentDim()?.dimType;
+  const extra = dimType === 'overworld' ? ` (${Math.round(total / 8)} nether blocks)` : '';
+  $('coords').textContent = `measured: ${Math.round(total)} blocks${extra} — click to extend, untick to clear`;
+}
+
+function toggleMeasure() {
+  const on = ($('toggle-measure') as HTMLInputElement).checked;
+  if (measure?.line) map.removeLayer(measure.line);
+  measure = on ? { points: [], line: null } : null;
+  map.getContainer().style.cursor = on ? 'crosshair' : '';
 }
 
 // -------------------------------------------------- atlas underlay (local) --
@@ -371,11 +464,18 @@ const AtlasUnderlayGrid = L.GridLayer.extend({
       };
       img.src = `./atlas/${set.url}/${z}/${iy}/${ix}.png`;
     };
-    const ix0 = Math.floor((X0 - set.originX) / bpt);
-    const ix1 = Math.floor((X0 + S - 1e-6 - set.originX) / bpt);
-    const iy0 = Math.floor((Z0 - set.originZ) / bpt);
-    const iy1 = Math.floor((Z0 + S - 1e-6 - set.originZ) / bpt);
-    if ((ix1 - ix0 + 1) * (iy1 - iy0 + 1) <= 64) {
+    // Clamp to the pyramid's real extent at this level before the cell-count
+    // guard: a far-out canvas tile spans many index cells, but only the few
+    // inside the pyramid exist — counting the void used to blank the whole
+    // underlay at overview zooms. Without an index, the google layout's
+    // level-doubling (1 tile at zMin) still bounds the extent.
+    const idx = atlasIndexes.get(set.url);
+    const side = idx ? idx.sides[az - idx.zMin] : Math.pow(2, az - set.zMin);
+    const ix0 = Math.max(0, Math.floor((X0 - set.originX) / bpt));
+    const ix1 = Math.min(side - 1, Math.floor((X0 + S - 1e-6 - set.originX) / bpt));
+    const iy0 = Math.max(0, Math.floor((Z0 - set.originZ) / bpt));
+    const iy1 = Math.min(side - 1, Math.floor((Z0 + S - 1e-6 - set.originZ) / bpt));
+    if (ix1 >= ix0 && iy1 >= iy0 && (ix1 - ix0 + 1) * (iy1 - iy0 + 1) <= 64) {
       for (let iy = iy0; iy <= iy1; iy++) {
         for (let ix = ix0; ix <= ix1; ix++) {
           const tx = set.originX + ix * bpt;
@@ -657,7 +757,9 @@ function redrawAtlas() {
 }
 
 function replaceBaseLayer() {
-  if (baseLayer) map.removeLayer(baseLayer);
+  // Keep the outgoing layer visible until the incoming one has painted —
+  // removing it first blanks the whole view for the round-trip.
+  const old = baseLayer;
   baseLayer = L.tileLayer(tileUrl(), {
     tileSize: 512,
     minZoom: -16,
@@ -672,6 +774,15 @@ function replaceBaseLayer() {
   });
   baseLayer.on('loading', () => ($('tile-loading').hidden = false));
   baseLayer.on('load', () => ($('tile-loading').hidden = true));
+  if (old) {
+    // 'load' can be missed entirely (nothing in view), so a timer backstops it.
+    const dropOld = () => {
+      clearTimeout(timer);
+      if (map.hasLayer(old)) map.removeLayer(old);
+    };
+    const timer = setTimeout(dropOld, 4000);
+    baseLayer.once('load', dropOld);
+  }
   baseLayer.addTo(map);
   const w = currentWorld();
   const d = currentDim();
@@ -722,6 +833,9 @@ function mergedCounterpart(): Selection | null {
   return { w: wi, d: di, m: mi, layer: sel.layer };
 }
 
+/** The roof view the uploads overlay was built with, so a change rebuilds it. */
+let ingestOverlayRoof = '';
+
 function updateIngestOverlay() {
   const row = $('row-live-overlay');
   const cb = $('toggle-live-overlay') as HTMLInputElement;
@@ -738,8 +852,10 @@ function updateIngestOverlay() {
     want.w === ingestOverlayFrom.w &&
     want.d === ingestOverlayFrom.d &&
     want.m === ingestOverlayFrom.m &&
-    want.layer === ingestOverlayFrom.layer;
+    want.layer === ingestOverlayFrom.layer &&
+    roofQuery() === ingestOverlayRoof;
   if (same || (!want && !ingestOverlayFrom)) return;
+  ingestOverlayRoof = roofQuery();
   if (ingestOverlay) {
     map.removeLayer(ingestOverlay);
     ingestOverlay = null;
@@ -747,7 +863,7 @@ function updateIngestOverlay() {
   ingestOverlayFrom = want;
   const f = ingestOverlayFrom;
   if (!f) return;
-  ingestOverlay = L.tileLayer(`./tiles/${f.w}/${f.d}/${f.m}/${f.layer}/{z}/{x}/{y}`, {
+  ingestOverlay = L.tileLayer(`./tiles/${f.w}/${f.d}/${f.m}/${f.layer}/{z}/{x}/{y}${roofQuery()}`, {
     tileSize: 512,
     minZoom: -16,
     maxZoom: 3,
@@ -922,6 +1038,8 @@ function visibleWaypoints(): { wp: WaypointJson; file: WaypointFileJson }[] {
 function redrawWaypoints() {
   waypointLayer.clearLayers();
   const list = $('wp-list');
+  // Rebuilt on every map move: the user's scroll position must survive it.
+  const scroll = list.scrollTop;
   list.innerHTML = '';
   if (!($('toggle-waypoints') as HTMLInputElement).checked) return;
   const v = viewWindow();
@@ -952,8 +1070,13 @@ function redrawWaypoints() {
         `<span class="muted">/tp ${wp.x} ${wp.y ?? 100} ${wp.z}</span></div>`
     );
     marker.addTo(waypointLayer);
+    if (pendingWpPopup === wpKey(wp)) {
+      pendingWpPopup = null;
+      marker.openPopup();
+    }
     list.appendChild(wpListItem(wp, marker));
   }
+  list.scrollTop = scroll;
 }
 
 function wpListItem(wp: WaypointJson, marker?: L.CircleMarker): HTMLLIElement {
@@ -973,6 +1096,9 @@ function wpListItem(wp: WaypointJson, marker?: L.CircleMarker): HTMLLIElement {
   coords.textContent = `${wp.x}, ${wp.z}`;
   li.append(dot, name, coords);
   li.onclick = () => {
+    // If the view doesn't move, the marker survives and opens directly; if it
+    // does, the moveend rebuild opens the popup via pendingWpPopup instead.
+    pendingWpPopup = wpKey(wp);
     map.setView(toLatLng(wp.x, wp.z), Math.max(map.getZoom(), -1));
     marker?.openPopup();
   };
@@ -995,14 +1121,18 @@ function safeUrl(u: string): string | null {
 }
 
 async function reloadWaypoints() {
+  const gen = ++wpReloadGen;
   waypointFiles = [];
   try {
     if (currentWorld()?.hasWaypoints) {
-      waypointFiles = await fetchWaypoints(sel.w);
+      const files = await fetchWaypoints(sel.w);
+      if (gen !== wpReloadGen) return; // a newer selection owns the list now
+      waypointFiles = files;
     }
   } catch (e) {
     console.warn('waypoints failed', e);
   }
+  if (gen !== wpReloadGen) return;
   redrawWaypoints();
 }
 
@@ -1032,16 +1162,29 @@ const livePlayers = new Map<string, LivePlayer>();
 const liveLayer = L.layerGroup();
 /** Player the view is glued to (kiosk/second-screen mode); null = free. */
 let followName: string | null = null;
+let liveWs: WebSocket | null = null;
+/** True between onopen and onclose. An "open" socket can still be dead
+ *  (NAT/proxy drop): tickLive closes one that has been silent too long. */
+let liveConnected = false;
+/** performance.now() of the last message on the socket, heartbeats included. */
+let liveLastRx = 0;
 let liveBackoff = 1000;
 let liveLastSeq = -1;
 let liveEverConnected = false;
 let resyncing = false;
+/** Tile/preview/db events discarded while a state resync was in flight. */
+let resyncDropped = false;
 let animPending = false;
 
 function connectLive() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws/live`);
+  // Path derived from the page's own, mirroring the tiles' relative URLs:
+  // behind a reverse proxy at a subpath, absolute /ws/live misses the mount.
+  const base = location.pathname.replace(/[^/]*$/, '');
+  const ws = new WebSocket(`${proto}://${location.host}${base}ws/live`);
+  liveWs = ws;
   ws.onmessage = (e) => {
+    liveLastRx = performance.now();
     try {
       handleLiveEvent(JSON.parse(e.data) as LiveEvent);
     } catch (err) {
@@ -1050,9 +1193,14 @@ function connectLive() {
   };
   ws.onopen = () => {
     liveBackoff = 1000;
+    liveConnected = true;
+    // Starts the silence clock: a stale value from the previous connection
+    // would get this socket closed before its hello even arrives.
+    liveLastRx = performance.now();
     $('live-status').textContent = '';
   };
   ws.onclose = () => {
+    liveConnected = false;
     $('live-status').textContent = 'live: reconnecting…';
     const delay = liveBackoff * (0.7 + Math.random() * 0.6); // jitter
     liveBackoff = Math.min(liveBackoff * 2, 15000);
@@ -1080,6 +1228,9 @@ function handleLiveEvent(ev: LiveEvent) {
       // This socket lagged behind the broadcast channel; events were skipped.
       refreshAllTileLayers(liveLastSeq + 1);
       break;
+    case 'hb':
+      // Idle keepalive: its receipt already fed liveLastRx in onmessage.
+      break;
     case 'pos':
       applyPos(ev, false);
       break;
@@ -1094,15 +1245,18 @@ function handleLiveEvent(ev: LiveEvent) {
     }
     case 'tiles':
       liveLastSeq = ev.v;
-      if (!resyncing) handleTilesEvent(ev);
+      if (resyncing) resyncDropped = true;
+      else handleTilesEvent(ev);
       break;
     case 'preview':
       liveLastSeq = ev.v;
-      if (!resyncing) handlePreviewEvent(ev);
+      if (resyncing) resyncDropped = true;
+      else handlePreviewEvent(ev);
       break;
     case 'db':
       liveLastSeq = ev.v;
-      if (!resyncing) handleDbEvent(ev);
+      if (resyncing) resyncDropped = true;
+      else handleDbEvent(ev);
       break;
     case 'state':
       liveLastSeq = ev.v;
@@ -1143,7 +1297,8 @@ function refreshLayerTiles(
     }
     const el = t.el as HTMLImageElement;
     if (!el || el.tagName !== 'IMG') continue;
-    const url = `${anyLayer.getTileUrl(c)}?v=${seq}`;
+    const base = anyLayer.getTileUrl(c);
+    const url = `${base}${base.includes('?') ? '&' : '?'}v=${seq}`;
     const img = new Image();
     img.onload = () => {
       el.src = url; // now cached: swaps without blanking
@@ -1242,6 +1397,12 @@ async function resyncState() {
     console.warn('state resync failed', e);
   } finally {
     resyncing = false;
+    if (resyncDropped) {
+      resyncDropped = false;
+      // Their seqs were already recorded, so the next hello comparison can't
+      // catch the loss — refresh in place exactly like a lagged reconnect.
+      refreshAllTileLayers(liveLastSeq);
+    }
   }
 }
 
@@ -1273,7 +1434,7 @@ function applyPos(ev: PosEvent, initial: boolean) {
     if (ev.t < p.t) return; // out-of-order update
     const gapMs = nowP - p.rxAt;
     const dist = Math.hypot(ev.x - p.x, ev.z - p.z);
-    const teleport = dist > Math.max(1, gapMs / 1000) * 50; // implausible speed
+    const teleport = dist > Math.max(1, gapMs / 1000) * 150; // beyond even boatfly/pitch40
     if (ev.dim !== p.dim || teleport || initial) {
       p.trail = [];
       p.fromX = ev.x;
@@ -1422,19 +1583,26 @@ function dimBadge(dimKey: string): { label: string; cls: string } {
 
 function renderPlayerList() {
   const list = $('player-list');
+  // Rebuilt every live tick: the user's scroll position must survive it.
+  const scroll = list.scrollTop;
   list.innerHTML = '';
   const players = [...livePlayers.values()].sort((a, b) => a.name.localeCompare(b.name));
-  if (players.length === 0) {
+  if (!liveConnected) {
+    // The ticks keep calling in here while the socket is down; a roster
+    // count must not clobber the reconnect notice onclose wrote.
+    $('live-status').textContent = 'live: reconnecting…';
+  } else if (players.length === 0) {
     $('live-status').textContent = followName
       ? `waiting for ${followName}…`
       : 'no live players — connect the companion addon (see the Share panel)';
-    return;
+  } else {
+    $('live-status').textContent = followName
+      ? livePlayers.has(followName)
+        ? `following ${followName} — drag the map to stop`
+        : `waiting for ${followName}…`
+      : '';
   }
-  $('live-status').textContent = followName
-    ? livePlayers.has(followName)
-      ? `following ${followName} — drag the map to stop`
-      : `waiting for ${followName}…`
-    : '';
+  if (players.length === 0) return;
   const nowP = performance.now();
   for (const p of players) {
     const li = document.createElement('li');
@@ -1483,6 +1651,7 @@ function renderPlayerList() {
     li.onclick = () => jumpToPlayer(p);
     list.appendChild(li);
   }
+  list.scrollTop = scroll;
 }
 
 /** Switches the current world's view to the dimension a player is in.
@@ -1532,15 +1701,28 @@ function followPan(p: LivePlayer, jump = false) {
   if (jump) {
     map.setView(toLatLng(p.x, p.z), Math.max(map.getZoom(), 0));
   } else {
-    map.panTo(toLatLng(p.x, p.z));
+    // Positions land ~1/s and each pan restarts mid-flight; a linear ease
+    // over the full gap chains consecutive pans without rubber-banding.
+    map.panTo(toLatLng(p.x, p.z), { animate: true, duration: 1.0, easeLinearity: 1 });
   }
 }
 
-/** Roster ages and marker staleness; pure UI, no server traffic. */
+/** Roster ages, marker staleness, trail decay, and the dead-socket watchdog. */
 function tickLive() {
+  // The server heartbeats idle sockets every 25 s, so a minute of silence on
+  // an "open" socket means the path is dead in a way no close event reported
+  // (NAT/proxy drop). Closing it hands recovery to the backoff reconnect.
+  if (liveConnected && liveWs && performance.now() - liveLastRx > 60_000) {
+    liveWs.close();
+  }
   renderPlayerList();
+  const nowP = performance.now();
   for (const p of livePlayers.values()) {
-    p.marker?.getElement()?.classList.toggle('stale', (performance.now() - p.rxAt) / 1000 > 30);
+    p.marker?.getElement()?.classList.toggle('stale', (nowP - p.rxAt) / 1000 > 30);
+    // Trails otherwise shrink only when new positions arrive: a player who
+    // stops reporting would keep a frozen minute of history on screen.
+    while (p.trail.length > 0 && nowP - p.trail[0].at > 60_000) p.trail.shift();
+    updateTrail(p);
   }
 }
 
@@ -2033,6 +2215,8 @@ function addHlLayer(db: string) {
     noWrap: true,
     keepBuffer: 2,
     errorTileUrl: TRANSPARENT_TILE,
+    // Chunk-rects must stay crisp over the pixelated base at overzoom.
+    className: 'pixelated',
     opacity: 0.85,
     zIndex: 5,
   });
@@ -2072,6 +2256,7 @@ function wireEvents() {
   };
   $('toggle-guides').onchange = redrawGuides;
   $('toggle-grid').onchange = toggleGrid;
+  $('toggle-measure').onchange = toggleMeasure;
   const liveOverlayCb = $('toggle-live-overlay') as HTMLInputElement;
   liveOverlayCb.checked = localStorage.getItem('xt-live-overlay') !== '0'; // default on
   liveOverlayCb.onchange = () => {
@@ -2086,6 +2271,27 @@ function wireEvents() {
     updatePreviewLayer();
   };
   updatePreviewLayer();
+  const roofCb = $('toggle-roof') as HTMLInputElement;
+  const applyRoof = () => {
+    $('roof-opts').hidden = !roofCb.checked;
+    localStorage.setItem('xt-roof', roofCb.checked ? '1' : '0');
+    // Every layer drawn from region data carries the view in its URL.
+    replaceBaseLayer();
+    updateNetherToggle();
+    updateIngestOverlay();
+    writeHash();
+  };
+  roofCb.onchange = applyRoof;
+  $('roof-obsidian').onchange = applyRoof;
+  $('roof-snow').onchange = applyRoof;
+  // A hash link wins over the remembered choice; otherwise restore it. The
+  // layers were built before this point, so restoring has to rebuild them.
+  if (!roofCb.checked && localStorage.getItem('xt-roof') === '1') {
+    roofCb.checked = true;
+    applyRoof();
+  } else {
+    $('roof-opts').hidden = !roofCb.checked;
+  }
   $('toggle-nether').onchange = updateNetherToggle;
   $('toggle-atlas').onchange = () => toggleAtlas(true);
   $('atlas-refresh').onclick = refreshAtlas;
@@ -2289,11 +2495,96 @@ function setupTools() {
   }
 }
 
+/** First run, nothing found: a folder picker in the page, because the person
+ *  double-clicking the binary cannot be sent back to a terminal for --root. */
+function renderWelcome() {
+  const card = document.createElement('div');
+  card.className = 'welcome';
+  const inner = document.createElement('div');
+  inner.className = 'welcome-card';
+  inner.innerHTML = `
+    <h1>XaeroTools</h1>
+    <p>No Xaero's World Map data found on this computer yet.</p>`;
+  card.appendChild(inner);
+  document.body.replaceChildren(card);
+  if (!state.toolsEnabled) {
+    inner.insertAdjacentHTML(
+      'beforeend',
+      `<p>The host has not added any map folders yet — ask them to add one.</p>`
+    );
+    return;
+  }
+  inner.insertAdjacentHTML(
+    'beforeend',
+    `
+    <p>Pick the folder your maps live in — a <code>.minecraft</code> folder, a
+    launcher instance, or any backup copy. Folders are only read, never changed.</p>
+    <div class="welcome-row">
+      <input id="welcome-path" placeholder="path to .minecraft (or a backup folder)" spellcheck="false">
+      <button id="welcome-add">Add folder</button>
+    </div>
+    <p id="welcome-status"></p>
+    <div class="welcome-fs">
+      <div id="welcome-fs-path"></div>
+      <ul id="welcome-fs-list"></ul>
+    </div>`
+  );
+  const status = $('welcome-status');
+  const pathInput = $('welcome-path') as HTMLInputElement;
+  const tryAdd = async (path: string) => {
+    if (!path) return;
+    status.textContent = 'scanning…';
+    try {
+      await addRoot(path);
+      // The server canonicalizes paths, so judge success by what it now
+      // discovers rather than by matching the string we sent.
+      if ((await fetchState()).worlds.length > 0) {
+        location.reload();
+        return;
+      }
+      // A folder with no maps in it would sit uselessly in the config —
+      // undo, explain, let them pick again.
+      await removeRoot(path).catch(() => {});
+      status.textContent =
+        'No Xaero maps in that folder. Pick the folder that contains a "xaero" folder — usually .minecraft.';
+    } catch (e) {
+      status.textContent = String(e);
+    }
+  };
+  $('welcome-add').onclick = () => tryAdd(pathInput.value.trim());
+  pathInput.onkeydown = (e) => {
+    if (e.key === 'Enter') tryAdd(pathInput.value.trim());
+  };
+  const browse = async (path?: string) => {
+    try {
+      const listing = await fsList(path);
+      pathInput.value = listing.path;
+      $('welcome-fs-path').textContent = listing.path;
+      const ul = $('welcome-fs-list');
+      ul.innerHTML = '';
+      if (listing.parent) {
+        const up = document.createElement('li');
+        up.textContent = '↑ ..';
+        up.onclick = () => browse(listing.parent!);
+        ul.appendChild(up);
+      }
+      for (const d of listing.dirs) {
+        const li = document.createElement('li');
+        li.textContent = d;
+        li.onclick = () => browse(`${listing.path === '/' ? '' : listing.path}/${d}`);
+        ul.appendChild(li);
+      }
+    } catch (e) {
+      status.textContent = String(e);
+    }
+  };
+  browse();
+}
+
 async function boot() {
   state = await fetchState();
   if (state.worlds.length === 0) {
-    document.body.innerHTML =
-      '<p style="padding:2em">No Xaero worlds found. Restart with <code>--root &lt;path&gt;</code>.</p>';
+    renderWelcome();
     return;
   }
   setupMap();
@@ -2306,6 +2597,17 @@ async function boot() {
   } else {
     applySelection();
   }
+  // A permalink pasted into the open tab. Our own writeHash goes through
+  // replaceState, which never fires this, so it only runs for outside edits.
+  addEventListener('hashchange', () => {
+    const h = readHash();
+    if (!h) return;
+    sel = h.sel;
+    applySelection();
+    map.setView(toLatLng(h.x, h.z), h.zoom);
+    // The link may carry ?atlas=1: show stored POIs, never fetch remotely.
+    if (($('toggle-atlas') as HTMLInputElement).checked) toggleAtlas(false);
+  });
   wireEvents();
   setupTools();
   setupRoots();

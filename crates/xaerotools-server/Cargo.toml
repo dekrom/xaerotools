@@ -18,6 +18,6 @@ include_dir = "0.7"
 lru = "0.18.2"
 rayon = "1"
 xaero-merge = { path = "../xaero-merge" }
-xaero-db = { version = "0.1.0", path = "../xaero-db" }
+xaero-db = { path = "../xaero-db" }
 getrandom = "0.4.3"
 rusqlite = { version = "0.37", features = ["bundled"] }

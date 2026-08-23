@@ -56,6 +56,10 @@ const REINDEX_MIN: Duration = Duration::from_secs(30);
 /// Ingest rate limit per player (4+ accounts at ~1/s must pass easily).
 const RATE_PER_SEC: f64 = 5.0;
 const RATE_BURST: f64 = 10.0;
+/// A quiet /ws/live socket sends an "hb" data message this often. Browser JS
+/// cannot observe protocol ping frames, so bounded silence is the only way a
+/// client can tell a NAT/proxy-killed connection from an idle map.
+const WS_HEARTBEAT: Duration = Duration::from_secs(25);
 
 pub(crate) struct LiveState {
     /// Pre-serialized JSON events fanned out to every /ws/live client.
@@ -199,6 +203,7 @@ fn region_change(
             dim: d,
             mw: m,
             cave,
+            roof: None,
         },
         rx,
         rz,
@@ -325,10 +330,25 @@ async fn apply_batch(st: &Arc<AppState>, events: Vec<FsEvent>, th: &mut Throttle
             ring.pop_front();
         }
     }
-    // Only maps someone has viewed are cached; the rest rebuild lazily.
+    // Only maps someone has viewed are cached; the rest rebuild lazily. But a
+    // viewer sitting at z=0 never builds an index (native tiles are served by
+    // stat), so changes for un-indexed maps still need a native tiles event —
+    // dropping them silently would freeze exactly that viewer.
     {
         let indexed = st.indexes.read().unwrap();
-        regions.retain(|m, _| indexed.contains_key(m));
+        let mut unindexed: Vec<(MapId, Vec<(i32, i32)>)> = Vec::new();
+        regions.retain(|m, rs| {
+            if indexed.contains_key(m) {
+                true
+            } else {
+                unindexed.push((m.clone(), rs.iter().copied().collect()));
+                false
+            }
+        });
+        drop(indexed);
+        for (map, rs) in unindexed {
+            emit_tiles(st, &map, Some(&rs), false);
+        }
     }
     if regions.is_empty() {
         return;
@@ -380,6 +400,10 @@ fn apply_region_changes(
         };
         let mut new_index: Option<xaero_scan::RegionIndex> = None;
         let mut applied = Vec::new();
+        // Coordinates new to the index: the overzoom compose finds regions
+        // through the spatial buckets, so these must be inserted there too or
+        // fresh terrain never shows up in zoomed-out tiles.
+        let mut added = Vec::new();
         for (rx, rz) in coords {
             let fresh = stat_region(&dir, rx, rz);
             let old = idx.entries.get(&(rx, rz)).copied();
@@ -389,9 +413,14 @@ fn apply_region_changes(
             let ni = new_index.get_or_insert_with(|| (*idx).clone());
             match fresh {
                 Some(meta) => {
+                    if old.is_none() {
+                        added.push((rx, rz));
+                    }
                     ni.entries.insert((rx, rz), meta);
                 }
                 None => {
+                    // Stale bucket entries are harmless: the compose drops
+                    // coordinates the index no longer knows.
                     ni.entries.remove(&(rx, rz));
                 }
             }
@@ -406,6 +435,17 @@ fn apply_region_changes(
             }
             if let Some(cache) = guard.get_mut(&map) {
                 cache.index = Arc::new(ni);
+                if !added.is_empty() {
+                    let mut buckets = (*cache.buckets).clone();
+                    for (rx, rz) in added {
+                        let cell = (rx.div_euclid(crate::BUCKET), rz.div_euclid(crate::BUCKET));
+                        let v = buckets.entry(cell).or_default();
+                        if !v.contains(&(rx, rz)) {
+                            v.push((rx, rz));
+                        }
+                    }
+                    cache.buckets = Arc::new(buckets);
+                }
                 out.push((map, applied));
             }
         }
@@ -492,6 +532,7 @@ async fn maybe_degrade(st: &Arc<AppState>, th: &mut Throttle) {
             if changed.is_empty() {
                 continue;
             }
+            cache.buckets = Arc::new(crate::build_buckets(&fresh));
             cache.index = Arc::new(fresh);
             cache.gen = st.generation.fetch_add(1, Ordering::Relaxed) + 1;
             drop(guard);
@@ -872,20 +913,33 @@ async fn handle_socket(st: Arc<AppState>, socket: WebSocket) {
         // A lagged receiver skips what it missed and tells the client to
         // refresh its layers in place — dropping the socket made every
         // reconnecting viewer blank and redraw the whole screen instead.
+        let mut hb = tokio::time::interval(WS_HEARTBEAT);
+        hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        hb.reset(); // the first tick fires immediately; the hello just went out
         loop {
-            match rx.recv().await {
-                Ok(msg) => {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Ok(msg) => {
+                        if sink.send(Message::Text(msg.into())).await.is_err() {
+                            break;
+                        }
+                        hb.reset(); // real traffic proves liveness on its own
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let resync = serde_json::json!({"type": "resync"}).to_string();
+                        if sink.send(Message::Text(resync.into())).await.is_err() {
+                            break;
+                        }
+                        hb.reset();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = hb.tick() => {
+                    let msg = serde_json::json!({"type": "hb"}).to_string();
                     if sink.send(Message::Text(msg.into())).await.is_err() {
                         break;
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    let resync = serde_json::json!({"type": "resync"}).to_string();
-                    if sink.send(Message::Text(resync.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
@@ -1177,7 +1231,8 @@ mod tests {
                     world: 0,
                     dim: 0,
                     mw: 0,
-                    cave: None
+                    cave: None,
+                    roof: None
                 },
                 rx: 12,
                 rz: -34
@@ -1192,7 +1247,8 @@ mod tests {
                     world: 0,
                     dim: 1,
                     mw: 0,
-                    cave: Some(7)
+                    cave: Some(7),
+                    roof: None
                 },
                 rx: 1,
                 rz: 2

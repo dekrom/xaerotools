@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
-use xaero_core::render::{ColorTable, LightMode, RenderOpts};
+use xaero_core::render::{ColorTable, RenderOpts};
 use xaero_scan::index_regions;
 
 use crate::COLORTABLE;
@@ -30,6 +30,7 @@ pub fn render_cmd(args: &[String]) {
     let mut layer: Option<String> = None;
     let mut bbox: Option<(i64, i64, i64, i64)> = None;
     let mut all = false;
+    let mut roof = None;
     let mut cell: usize = REGION as usize;
     let mut max_px = DEFAULT_MAX_PX;
     let mut out: Option<PathBuf> = None;
@@ -64,6 +65,7 @@ pub fn render_cmd(args: &[String]) {
                 i += 1;
                 bbox = Some(parse_bbox(&args[i]));
             }
+            "--roof" => roof = Some(crate::ROOF_DEFAULT),
             "--all" => all = true,
             "--zoom" => {
                 i += 1;
@@ -190,12 +192,15 @@ pub fn render_cmd(args: &[String]) {
     );
 
     let ct = ColorTable::parse(COLORTABLE).expect("embedded color table");
+    // Nether folders get the nether's ambient light and logical height; the
+    // cave selection forces every tile's cave mode so legacy tiles follow the
+    // layer they sit in.
+    let nether = sel.dim == "DIM-1";
     let opts = RenderOpts {
-        light_mode: if sel.cave.is_some() {
-            LightMode::Multiply
-        } else {
-            LightMode::Ignore
-        },
+        dim_ambient: if nether { 0.1 } else { 0.0 },
+        logical_height: if nether { 128 } else { 384 },
+        cave_override: sel.cave,
+        roof,
         ..Default::default()
     };
 

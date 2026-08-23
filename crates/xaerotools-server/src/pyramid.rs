@@ -17,8 +17,9 @@
 //! to the pure in-memory behaviour.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
@@ -39,22 +40,34 @@ const WRITE_QUEUE_CAP: usize = 8192;
 pub(crate) struct PyramidStore {
     read: Mutex<Connection>,
     tx: mpsc::SyncSender<ThumbRow>,
+    /// Committed write batches so far. Lets a caller skip a bbox prefetch it
+    /// already ran when nothing new can have landed since.
+    writes: Arc<AtomicU64>,
 }
 
 fn open_conn(path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    // Two serve processes may share the store (they share the config dir);
+    // without a timeout the loser of any write/checkpoint collision errors
+    // instantly and a whole batch of thumbnails silently never persists.
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| e.to_string())?;
+    // t8 sits before t32 so deep-zoom bbox reads (t8 only, the common case on
+    // a huge archive) never have to walk the 4 KiB t32 blob's overflow pages.
+    // Existing stores created with the reverse order keep working — every
+    // statement names its columns.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS thumbs(
             dir   TEXT    NOT NULL,
             rx    INTEGER NOT NULL,
             rz    INTEGER NOT NULL,
             mtime INTEGER NOT NULL,
-            t32   BLOB    NOT NULL,
             t8    BLOB    NOT NULL,
+            t32   BLOB    NOT NULL,
             PRIMARY KEY(dir, rx, rz)
         ) WITHOUT ROWID;",
     )
@@ -62,25 +75,51 @@ fn open_conn(path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
+/// Bump when the renderer's output changes: stored thumbnails are rendered
+/// pixels, so a new algorithm must retire every old row or the map shows a
+/// patchwork of old and new looks. Checked via `PRAGMA user_version`.
+const RENDER_ALGO_VERSION: i32 = 2;
+
 impl PyramidStore {
     /// Opens (or creates) the store. `Err` is advisory — callers run without.
     pub(crate) fn open(path: &Path) -> Result<PyramidStore, String> {
         let read = open_conn(path)?;
+        let stored: i32 = read
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if stored != RENDER_ALGO_VERSION {
+            if stored != 0 {
+                eprintln!("pyramid store: render algorithm changed — thumbnails will regenerate");
+            }
+            read.execute_batch(&format!(
+                "DELETE FROM thumbs; PRAGMA user_version = {RENDER_ALGO_VERSION}; VACUUM;"
+            ))
+            .map_err(|e| e.to_string())?;
+        }
         let write = open_conn(path)?;
         let (tx, rx) = mpsc::sync_channel::<ThumbRow>(WRITE_QUEUE_CAP);
+        let writes = Arc::new(AtomicU64::new(0));
+        let writes_w = writes.clone();
         std::thread::Builder::new()
             .name("xt-pyramid-write".into())
-            .spawn(move || writer_loop(write, rx))
+            .spawn(move || writer_loop(write, rx, writes_w))
             .map_err(|e| e.to_string())?;
         Ok(PyramidStore {
             read: Mutex::new(read),
             tx,
+            writes,
         })
     }
 
     /// Queues one region's thumbnails. Never blocks; a full queue drops.
     pub(crate) fn put(&self, row: ThumbRow) {
         let _ = self.tx.try_send(row);
+    }
+
+    /// Monotonic count of committed write batches. Equal counts before and
+    /// after mean a repeated bbox prefetch cannot find anything new.
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Acquire)
     }
 
     /// Every stored thumbnail inside the bbox (inclusive), as
@@ -142,7 +181,7 @@ impl PyramidStore {
 
 /// Drains the queue into batched transactions. Exits when every sender is
 /// dropped (server shutdown).
-fn writer_loop(conn: Connection, rx: mpsc::Receiver<ThumbRow>) {
+fn writer_loop(conn: Connection, rx: mpsc::Receiver<ThumbRow>, writes: Arc<AtomicU64>) {
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
         // Take whatever else is already queued, up to one transaction's worth.
@@ -153,7 +192,10 @@ fn writer_loop(conn: Connection, rx: mpsc::Receiver<ThumbRow>) {
             }
         }
         let write = || -> rusqlite::Result<()> {
-            conn.execute_batch("BEGIN")?;
+            // IMMEDIATE takes the write lock up front, so a collision with
+            // another process surfaces here (and waits out the busy timeout)
+            // instead of failing the COMMIT after all the work.
+            conn.execute_batch("BEGIN IMMEDIATE")?;
             {
                 let mut stmt = conn.prepare_cached(
                     "INSERT OR REPLACE INTO thumbs(dir, rx, rz, mtime, t32, t8)
@@ -173,9 +215,14 @@ fn writer_loop(conn: Connection, rx: mpsc::Receiver<ThumbRow>) {
             conn.execute_batch("COMMIT")?;
             Ok(())
         };
-        if let Err(e) = write() {
-            let _ = conn.execute_batch("ROLLBACK");
-            eprintln!("pyramid store write failed: {e}");
+        match write() {
+            Ok(()) => {
+                writes.fetch_add(1, Ordering::Release);
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                eprintln!("pyramid store write failed: {e}");
+            }
         }
     }
 }

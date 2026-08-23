@@ -30,17 +30,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: npm ci && npm run build
-        working-directory: webui
+      # A tag that doesn't match the workspace version would silently release
+      # a mislabeled build — fail instead.
+      - name: Tag must match workspace version
+        shell: bash
+        run: grep -q "^version = \"${GITHUB_REF_NAME#v}\"$" Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release -p xaerotools --target ${{ matrix.target }}
+      # 7z is what the windows runner zips with, but 7z-built zips drop the
+      # unix executable bit — a mac or linux zip made that way would ship an
+      # un-runnable binary, so those runners use zip -r.
       - name: Package
         shell: bash
         run: |
@@ -48,8 +51,21 @@ jobs:
           BIN=target/${{ matrix.target }}/release/xaerotools
           [ -f "$BIN.exe" ] && BIN="$BIN.exe"
           cp "$BIN" dist/
-          cp README.md LICENSE dist/ 2>/dev/null || cp README.md dist/
-          cd dist && 7z a ../${{ matrix.name }}.zip . || zip -r ../${{ matrix.name }}.zip .
+          if [ -f dist/xaerotools ]; then chmod +x dist/xaerotools; fi
+          cp LICENSE dist/
+          printf '%s\n' \
+            'XaeroTools — double-click the xaerotools file to start.' \
+            'Windows says it protected your PC? Click More info, then Run anyway.' \
+            'macOS blocked it? Open Terminal, paste: xattr -d com.apple.quarantine   then drag the xaerotools file into the window and press Enter.' \
+            'The map opens at http://127.0.0.1:45746 — keep this window open. Closing it stops the map.' \
+            'Help: https://github.com/dekrom/xaerotools#faq--something-didnt-work' \
+            > dist/START-HERE.txt
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a ../${{ matrix.name }}.zip .
+          else
+            zip -r ../${{ matrix.name }}.zip .
+          fi
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: ${{ matrix.name }}.zip
@@ -58,17 +74,23 @@ jobs:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}.zip
 
-  # One job attaches all four zips to a single draft release — parallel
-  # matrix legs each creating a draft for the same tag race into duplicates.
+  # One job attaches all four zips to a single release — parallel matrix legs
+  # each creating a release for the same tag race into duplicates.
   release:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+      - run: sha256sum *.zip > SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
-          files: "*.zip"
-          draft: true
+          files: |
+            *.zip
+            SHA256SUMS.txt
+          body_path: .github/RELEASE_BODY.md
+          draft: false
+          make_latest: true
           generate_release_notes: true

@@ -55,6 +55,8 @@ struct DimCanvas {
     chunks: HashMap<(i32, i32), ChunkPix>,
     /// Insertion order for the eviction cap (pushed on first insert only).
     order: VecDeque<(i32, i32)>,
+    /// Bumped on every mutation; the preview tiles' cache validator.
+    gen: u64,
 }
 
 pub(crate) struct PreviewState {
@@ -92,6 +94,9 @@ impl PreviewState {
             for cz in rz * 32..rz * 32 + 32 {
                 removed |= canvas.chunks.remove(&(cx, cz)).is_some();
             }
+        }
+        if removed {
+            canvas.gen += 1;
         }
         removed
     }
@@ -214,6 +219,7 @@ pub(crate) async fn ingest_preview(
                 None => break,
             }
         }
+        canvas.gen += 1;
     }
 
     let seq = st.live.seq.fetch_add(1, Ordering::Relaxed) + 1;
@@ -227,10 +233,29 @@ pub(crate) async fn ingest_preview(
 /// geometry as the map tiles (one region = one 512px tile at z 0).
 pub(crate) async fn preview_tile(
     State(st): State<Arc<AppState>>,
+    headers: header::HeaderMap,
     AxPath((dim, z, x, y)): AxPath<(String, i32, i32, i32)>,
 ) -> Response {
     if !(-16..=0).contains(&z) {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    // The canvas generation is the content identity: any chunk landing or
+    // being evicted bumps it. A matching If-None-Match costs no render.
+    let gen = st
+        .preview
+        .dims
+        .lock()
+        .unwrap()
+        .get(&dim)
+        .map(|c| c.gen)
+        .unwrap_or(0);
+    let etag = format!("\"pv.{z}.{x}.{y}.{gen}\"");
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|c| c.trim() == etag))
+    {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
     }
     let rgba = render_preview_tile(&st, &dim, z, x, y);
     let body = match rgba {
@@ -242,8 +267,9 @@ pub(crate) async fn preview_tile(
     };
     (
         [
-            (header::CONTENT_TYPE, "image/png"),
-            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONTENT_TYPE, "image/png".to_string()),
+            (header::CACHE_CONTROL, "no-cache".to_string()),
+            (header::ETAG, etag),
         ],
         body,
     )

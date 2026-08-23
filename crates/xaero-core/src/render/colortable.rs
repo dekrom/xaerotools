@@ -125,6 +125,13 @@ impl ColorTable {
         {
             return *c;
         }
+        // Renames older than the baked alias table's window; old archives
+        // still carry these ids.
+        if let Some(target) = legacy_rename(name)
+            && let Some(c) = self.blocks.get(target)
+        {
+            return *c;
+        }
         self.heuristic(name)
     }
 
@@ -190,6 +197,13 @@ impl ColorTable {
     pub fn fallback_biome(&self) -> BiomeColors {
         self.fallback_biome
     }
+}
+
+fn legacy_rename(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "minecraft:grass_path" => "minecraft:dirt_path",
+        _ => return None,
+    })
 }
 
 struct P<'a> {

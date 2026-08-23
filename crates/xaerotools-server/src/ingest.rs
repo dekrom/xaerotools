@@ -43,18 +43,23 @@ const COORD_CAP: i32 = 100_000;
 pub(crate) struct IngestState {
     /// Rate buckets keyed by *validated* player name.
     rate: Mutex<HashMap<String, Bucket>>,
+    /// Highlight-row uploads get their own budget: a client streaming chunk
+    /// finds must not spend the allowance a region upload needs.
+    pub(crate) hl_rate: Mutex<HashMap<String, Bucket>>,
     /// Serializes read-modify-write cycles on the merged tree: two uploads of
-    /// the same region must not interleave decode/merge/rename.
-    write_lock: Mutex<()>,
+    /// the same region must not interleave decode/merge/rename, and a
+    /// highlight upsert must not land mid-rename.
+    pub(crate) write_lock: Mutex<()>,
     /// Serializes "new layer appeared" rescans so an upload burst triggers one
     /// rescan, not one per request.
-    rescan_gate: tokio::sync::Mutex<()>,
+    pub(crate) rescan_gate: tokio::sync::Mutex<()>,
 }
 
 impl IngestState {
     pub(crate) fn new() -> IngestState {
         IngestState {
             rate: Mutex::new(HashMap::new()),
+            hl_rate: Mutex::new(HashMap::new()),
             write_lock: Mutex::new(()),
             rescan_gate: tokio::sync::Mutex::new(()),
         }

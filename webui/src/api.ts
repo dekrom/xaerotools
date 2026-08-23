@@ -316,6 +316,11 @@ export interface ResyncEvent {
   type: 'resync';
 }
 
+/** Idle-socket keepalive; carries nothing, its arrival is the payload. */
+export interface HbEvent {
+  type: 'hb';
+}
+
 export type LiveEvent =
   | PosEvent
   | TilesEvent
@@ -324,7 +329,8 @@ export type LiveEvent =
   | StateChangedEvent
   | PlayerRemovedEvent
   | PreviewEvent
-  | ResyncEvent;
+  | ResyncEvent
+  | HbEvent;
 
 /** Removes a live player marker for every viewer (it returns the moment that
  *  account reports again). An already-gone player (404) is not an error. */

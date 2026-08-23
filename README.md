@@ -8,6 +8,8 @@
 
 **Browse, back up and share your Xaero's World Map — outside the game.**
 
+**[Download for Windows / macOS / Linux](https://github.com/dekrom/xaerotools/releases/latest)** — unzip, double-click, done.
+
 <img src="assets/viewer.webp" alt="A 2b2t archive in the XaeroTools viewer — spawn and its highway web, with overlays, waypoints, live share and merge tools open" width="900">
 
 *A real 2b2t archive in the viewer: spawn's highway web, XaeroPlus overlays,
@@ -52,20 +54,37 @@ map as they travel, before the game has even saved it.
    | macOS (Apple Silicon) | `xaerotools-macos-arm64.zip` |
    | macOS (Intel) | `xaerotools-macos-x86_64.zip` |
 
-2. **Unzip and run** `xaerotools`. It is a single portable file — no
-   installer, no admin rights.
-3. Your browser opens at `http://127.0.0.1:45746`. It finds your
-   `.minecraft/xaero` folders automatically, including Prism/MultiMC
-   instances.
+2. **Unzip and run** `xaerotools` — a single portable file, no installer, no
+   admin rights. A console window opens: that window is the app — keep it
+   open; closing it stops the map.
 
-Backups or maps somewhere else? Point at them:
+   > **Windows**: the first run shows a blue "Windows protected your PC"
+   > screen. The app is unsigned, not unsafe — every download is built in
+   > public by GitHub Actions and checksummed in `SHA256SUMS.txt`. Click
+   > **More info**, then **Run anyway**. Only needed once.
+
+   > **macOS**: the first run is blocked ("Apple could not verify…"). Unblock
+   > it once: open Terminal (Cmd+Space, type `Terminal`), paste
+   > `xattr -d com.apple.quarantine` followed by a space, drag the unzipped
+   > `xaerotools` file into the window, press Enter. Then double-click it.
+   > (Alternative: System Settings → Privacy & Security → **Open Anyway**.)
+
+3. **The browser opens by itself with your map.** It finds maps from the
+   vanilla launcher and from CurseForge, Modrinth App, Prism Launcher,
+   MultiMC, ATLauncher and GDLauncher instances automatically. If nothing was
+   found, the page that opens lets you point at your folder — no terminal
+   needed.
+
+Backups or maps somewhere else? Add them in the viewer — **World panel →
+Map roots → Browse** — or point at them from a terminal:
 
 ```
-xaerotools serve --root "D:\backups\xaero" --root "C:\Users\you\.minecraft" --open
+.\xaerotools serve --root "D:\backups\xaero" --root "C:\Users\you\.minecraft" --open
 ```
 
-> macOS: the binary is unsigned, so the first run is blocked. Fix it once
-> with `xattr -d com.apple.quarantine ./xaerotools`.
+(To open a terminal in the unzipped folder on Windows: type `cmd` into the
+Explorer address bar and press Enter. PowerShell needs the `.\` prefix; plain
+`xaerotools` also works in cmd.)
 
 ## The map viewer
 
@@ -106,13 +125,14 @@ closed) and the waypoints are back in game.
 
 ## Merging map folders
 
-Combine an old backup with your current map, or your map with a friend's.
-Every merge is a **dry run first** — it prints exactly what it would do and
-changes nothing until you add `--apply`:
+Combine an old backup with your current map, or your map with a friend's —
+in the viewer's **Tools** tab, or from a terminal. Every merge is a **dry run
+first** — it prints exactly what it would do and changes nothing until you
+add `--apply` (**Apply** in the Tools tab):
 
 ```
-xaerotools merge "D:\old-backup" "C:\...\xaero" -o "D:\merged"          # preview
-xaerotools merge "D:\old-backup" "C:\...\xaero" -o "D:\merged" --apply  # do it
+.\xaerotools merge "D:\old-backup" "C:\...\xaero" -o "D:\merged"          # preview
+.\xaerotools merge "D:\old-backup" "C:\...\xaero" -o "D:\merged" --apply  # do it
 ```
 
 - Where both sides mapped the same region, it merges **tile by tile** —
@@ -123,7 +143,7 @@ xaerotools merge "D:\old-backup" "C:\...\xaero" -o "D:\merged" --apply  # do it
 - Your source folders are **never modified**, and the output must be an
   empty folder.
 
-`xaerotools db-merge A.db B.db -o Merged.db --apply` merges databases on
+`.\xaerotools db-merge A.db B.db -o Merged.db --apply` merges databases on
 their own.
 
 ## Playing together
@@ -144,15 +164,18 @@ your group can run one shared map:
   them outright with `--ingest-no-caves`.
 - `.xt sync` uploads a whole existing map once — instant off-site backup.
 
-Each player gets their own access token (`xaerotools tokens generate <name>`).
-To share on your LAN:
+Any Companion release works with any XaeroTools release 0.2 or newer.
+
+Each player gets their own access token — generate it in the map's **Share
+panel**, or with `xaerotools tokens generate <name>`. To share on your LAN:
 
 ```
 xaerotools serve --lan --password mysecret
 ```
 
-For friends outside your LAN, use a VPN like Tailscale — the server speaks
-plain HTTP on purpose.
+The first `--lan` run makes Windows Firewall ask to allow network access —
+tick **Private networks**. For friends outside your LAN, use a VPN like
+Tailscale — the server speaks plain HTTP on purpose.
 
 ## Every map version since 1.12
 
@@ -202,6 +225,30 @@ redistributed. The full format documentation lives in `docs/PLAN.md`, and the
 live-share client contract in `docs/INGEST.md`.
 
 </details>
+
+## FAQ / something didn't work
+
+- **Windows says it "protected your PC".** Normal for an unsigned app —
+  click **More info**, then **Run anyway**. See [Get started](#get-started).
+- **macOS says it can't verify the app.** A one-time unblock — see
+  [Get started](#get-started).
+- **My antivirus flags it.** A false positive that small unsigned programs
+  get.
+  Every download is built in public by GitHub Actions from this source, and
+  `SHA256SUMS.txt` on the release page lets you verify your file.
+- **It says "port 45746 is busy — using 45747 instead".** That's fine — use
+  the address the window prints.
+- **No maps were found.** The page that opens lets you add your map folder
+  right in the browser. Where to look: CurseForge keeps instances under
+  `C:\Users\YOU\curseforge\minecraft\Instances\PACK\xaero`, the Modrinth App
+  under `%APPDATA%\ModrinthApp\profiles\PROFILE\xaero`.
+- **Where does XaeroTools keep its own data?** `%APPDATA%\xaerotools` on
+  Windows, `~/.local/share/xaerotools` elsewhere. Your game folders are only
+  ever read.
+- **Does anything go online?** No — everything stays on your machine. The
+  two opt-ins are the 2b2t Atlas overlay and `--lan` sharing.
+- **I closed the black window and the map stopped.** By design — that window
+  is the app. Double-click `xaerotools` to start it again.
 
 ## Roadmap
 

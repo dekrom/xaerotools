@@ -1,10 +1,5 @@
 # XaeroTools — dev & testing bundle
 
-> This document is staged at the root of the portable dev bundle by
-> `scripts/make-bundle.sh`. The `sample data/` corpus and `bin/` prebuilt
-> binary it describes are bundle-only — not part of this repository (the
-> test suite skips corpus tests when `sample data` is absent).
-
 Everything you need to run, test and keep developing XaeroTools on any machine.
 
 ## What's inside
@@ -38,9 +33,15 @@ viewer right after building.
 ## Run it
 
 ```
-./target/release/xaerotools                 # auto-detects .minecraft, starts the viewer
+./target/release/xaerotools                 # finds your maps, opens the viewer in your browser
 ./target/release/xaerotools help            # all commands (merge, db-merge, waypoints vault…)
 ```
+
+Map folders are detected across the vanilla launcher and CurseForge,
+Modrinth App, Prism Launcher (flatpak included), MultiMC, ATLauncher and
+GDLauncher instances. With nothing found it still starts — the page that
+opens in the browser lets you pick a folder, and the viewer's World panel
+adds more roots later.
 
 On Linux you can skip the build entirely: `bin/xaerotools-linux-x86_64` is
 ready to run.

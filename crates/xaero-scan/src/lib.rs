@@ -219,8 +219,15 @@ fn looks_like_world_dir(p: &Path) -> bool {
     entries.filter_map(|e| e.ok()).any(|e| {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        e.file_type().map(|t| t.is_dir()).unwrap_or(false)
-            && Dimension::from_worldmap_folder(&name).is_some()
+        let Ok(ft) = e.file_type() else { return false };
+        if ft.is_dir() {
+            return Dimension::from_worldmap_folder(&name).is_some();
+        }
+        // A world can hold nothing but XaeroPlus highlight databases: that is
+        // how a shared server's world starts when a client sends chunk finds
+        // before it has uploaded a region. `scan_world` already handles the
+        // shape — without this the folder never reaches it.
+        ft.is_file() && name.starts_with("XaeroPlus") && name.ends_with(".db")
     })
 }
 
@@ -554,15 +561,35 @@ pub fn default_root_candidates() -> Vec<PathBuf> {
         out.push(home.join(".minecraft"));
         out.push(home.join("AppData/Roaming/.minecraft"));
         out.push(home.join("Library/Application Support/minecraft"));
-        // Prism / MultiMC instances.
+        // Instance folders of the launchers people actually use. Depending on
+        // the launcher, the game dir is the instance dir itself or a
+        // `.minecraft`/`minecraft` inside it — push all three shapes and let
+        // the xaero-dir filter below keep whichever is real.
         for base in [
+            // Prism / MultiMC
             home.join(".local/share/PrismLauncher/instances"),
+            home.join(".var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances"),
             home.join("AppData/Roaming/PrismLauncher/instances"),
             home.join("Library/Application Support/PrismLauncher/instances"),
             home.join(".local/share/multimc/instances"),
+            // CurseForge (Windows default, and the Documents fallback it and
+            // macOS use)
+            home.join("curseforge/minecraft/Instances"),
+            home.join("Documents/curseforge/minecraft/Instances"),
+            // Modrinth App (both its folder names, per platform)
+            home.join("AppData/Roaming/ModrinthApp/profiles"),
+            home.join("AppData/Roaming/com.modrinth.theseus/profiles"),
+            home.join(".local/share/ModrinthApp/profiles"),
+            home.join(".local/share/com.modrinth.theseus/profiles"),
+            home.join("Library/Application Support/ModrinthApp/profiles"),
+            home.join("Library/Application Support/com.modrinth.theseus/profiles"),
+            // ATLauncher / GDLauncher
+            home.join("AppData/Roaming/ATLauncher/instances"),
+            home.join("AppData/Roaming/gdlauncher_next/instances"),
         ] {
             if let Ok(instances) = std::fs::read_dir(&base) {
                 for inst in instances.filter_map(|e| e.ok()).take(64) {
+                    out.push(inst.path());
                     out.push(inst.path().join(".minecraft"));
                     out.push(inst.path().join("minecraft"));
                 }
@@ -571,6 +598,8 @@ pub fn default_root_candidates() -> Vec<PathBuf> {
     }
     // Some packs put the mod's data under config/xaero/ instead of xaero/.
     out.retain(|p| p.join("xaero").is_dir() || p.join("config").join("xaero").is_dir());
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.clone()));
     out
 }
 
@@ -882,6 +911,28 @@ mod tests {
                     tag: "20240705-215039-QQNGROR".into()
                 }));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shared server's world starts as highlight databases and nothing
+    /// else — the chunk finds arrive before the first region upload.
+    #[test]
+    fn finds_a_world_that_is_only_highlight_databases() {
+        let root = std::env::temp_dir().join(format!("xt-scan-dbonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let world = root.join("world-map").join("Multiplayer_2b2t");
+        std::fs::create_dir_all(&world).unwrap();
+        std::fs::write(world.join("XaeroPlusNewChunks.db"), b"").unwrap();
+        // A stray database elsewhere must not turn its folder into a world.
+        let other = root.join("world-map").join("notes");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("recipes.db"), b"").unwrap();
+
+        let worlds = discover_root(&root);
+        assert_eq!(worlds.len(), 1);
+        assert_eq!(worlds[0].id, "Multiplayer_2b2t");
+        assert!(worlds[0].dims.is_empty());
+        assert_eq!(worlds[0].databases, vec!["XaeroPlusNewChunks.db"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

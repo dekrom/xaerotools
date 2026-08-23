@@ -245,7 +245,12 @@ fn read_tile(
         pixels.push(read_pixel(rd, params, framing, ctx)?);
     }
     let interp_version = if framing.minor >= 4 { rd.u8()? } else { 0 };
-    let cave_start = if framing.minor >= 6 { rd.i32()? } else { 0 };
+    let cave_start = if framing.minor >= 6 {
+        rd.i32()?
+    } else {
+        // No trailer means a surface tile, not a cave layer at Y=0.
+        i32::MAX
+    };
     let cave_depth = if framing.minor >= 7 { rd.u8()? } else { 32 };
     Ok(Tile {
         pixels,
@@ -389,8 +394,13 @@ fn read_overlay(rd: &mut Rd<'_>, framing: Framing, ctx: &mut Ctx<'_>) -> Result<
         rd.i32()?;
     }
     // Opacity moved from a trailing i32 into params bits 11-14 in minor 8.
-    if framing.minor < 8 && params & O_LEGACY_OPACITY != 0 {
-        ov.legacy_opacity = Some(rd.i32()?);
+    // An absent field on a legacy overlay means opacity 1, not 0.
+    if framing.minor < 8 {
+        ov.legacy_opacity = Some(if params & O_LEGACY_OPACITY != 0 {
+            rd.i32()?
+        } else {
+            1
+        });
     }
     Ok(ov)
 }

@@ -395,3 +395,70 @@ in place (do **not** clear them — re-fetch and swap):
 ```json
 {"type":"resync"}
 ```
+
+## POST /ingest/v1/highlights
+
+Shares the chunks XaeroPlus finds — new chunks, old chunks, portals — with a
+server that keeps its **own** database of them. The server merges the rows
+into `merged/world-map/<world>/XaeroPlus<Kind>.db` under its ingest dir, which
+is already served as a map root, so they appear as the ordinary highlight
+overlay for that world. The file stays a valid XaeroPlus v2 database and can
+be copied straight back into a game instance.
+
+Only rows travel, never the database. A real one runs to gigabytes and carries
+no index on `foundTime`, so neither uploading nor rescanning it is affordable;
+a client streams what it has found since its last accepted batch instead.
+
+**Remote servers only.** A server on the same machine as the game already
+reads those databases through a scanned root, and a second copy of the same
+data would diverge from the first. Uploads from a loopback peer are refused
+with 403, and a client should not offer the feature when its server URL is
+local.
+
+### Request
+
+```
+POST /ingest/v1/highlights?world=Multiplayer_2b2t&db=XaeroPlusNewChunks.db&dim=minecraft:overworld
+Authorization: Bearer <token>
+Content-Type: application/octet-stream
+```
+
+- `world` — the world folder the rows belong to, as in region ingest.
+- `db` — the database file name. Exactly one of `XaeroPlusNewChunks.db`,
+  `XaeroPlusOldChunks.db`, `XaeroPlusPortals.db`. The multi-gigabyte palette
+  and modern-chunk databases are seeded out of band, and the height-valued
+  `XaeroPlusLavaColumns.db` is not a stream of sightings, so neither syncs.
+- `dim` — the dimension resource key (`minecraft:the_nether`), which is also
+  the table name in the v2 schema.
+
+Body (all integers little-endian):
+
+```
+"XTHL"  u8 version = 1  u16 count            (count ≤ 4096)
+then count × {
+  i32 x  i32 z                               (CHUNK coordinates)
+  i64 foundTime                              (epoch ms of first sighting)
+}
+```
+
+### Responses
+
+204 accepted; 400 for a malformed batch, an unsyncable `db`, a bad `dim` key
+or out-of-range chunk coordinates; 403 when the peer is loopback (see above)
+or the token is invalid; 429 over the rate limit (**2 batches/s sustained,
+burst 6** per player — a batch holds 4096 rows).
+
+Rows merge by first sighting: the **oldest** `foundTime` for a chunk wins, so
+re-sending a row the server already has is harmless and changes nothing.
+
+### Client behaviour
+
+- Keep a watermark per (world, db, dimension) and send only rows above it.
+  Start it at the current time the first time a database is seen — walking the
+  history is what this endpoint exists to avoid.
+- Advance the watermark only on 204, so a failed batch retries.
+- Stop for the session on 403 or 404: the first means the server is not remote,
+  the second that it predates this endpoint. Neither improves on retry.
+- The reference implementation is the companion addon's `HighlightSync`, which
+  reads XaeroPlus's in-memory find cache on the client tick rather than its
+  database.
