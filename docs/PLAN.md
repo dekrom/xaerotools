@@ -16,7 +16,7 @@ The user is a long-time 2b2t player with **300+ GB** of Xaero's World Map / Xaer
 - **Format scope: everything the game reads** — region majors 0..=7, minor ≤ 8, plus pre-versioned saves; writer emits 7/8. `minor` selects the pixel/tile framing, `major` selects block/biome identity: major 0 stores a numeric 1.12 block id+meta and a numeric biome id, majors 1+ use NBT blockstates, majors 4+ palette their biomes. Legacy ids resolve through `assets/legacy_block_ids.bin` (baked from the jar's `vanilla_states.dat`, mod renames applied) and a built-in biome table. This is not optional: a real long-lived 2b2t archive is ~half major-0 (measured 61.6% of one overworld folder). No JourneyMap import.
 - Distribution must not read as malware (user rejected bare unsigned .exe as the only channel); user delegated stack choice asking for "the most effective option" → **Rust workspace** (core crate kept WASM-compilable for a future zero-install browser build) + **vanilla TS + Leaflet + Vite web UI** embedded in one portable binary.
 - Security: localhost-only by default, opt-in LAN with password, no telemetry, Atlas calls opt-in, mergers never touch sources.
-- New repo at `<workspace>/xaerotools/` (cwd keeps reference material: XaeroPlus source, coordman-main, sample data, mod jars).
+- This repository; the workspace around it keeps the reference material used to derive the format: XaeroPlus source, coordman-main, sample data, mod jars.
 
 ---
 
@@ -45,7 +45,7 @@ Static Leaflet 1.7 viewer + one-time Python tile bake; `L.CRS.Simple` (map coord
 ### 2b2t Atlas API (probed)
 Real backend `https://api.blackportal.cloud` (frontend is Blazor WASM; `/api` page looks broken but isn't the API). `GET /api/locations` → 1242 locations (name, description, tags comma-string, dimension 0=OW/2=End, x/y/z, wiki, videoUrl, dateAddedUtc, warps, attachments, renders); `GET /api/locations/{rowid}`. **No auth, CORS `*`** (browser can fetch directly), Cloudflare cache 60 s. `renders[]` = Leaflet-ready XYZ pyramids of historical WDL renders: `tilesPath .../{z}/{y}/{x}.png` (y before x), 256px tiles, `coordinateScheme: atlas-sparse-v1` → at z: `tile_index = floor(world/512) + 250·2^(z−9)`; **native z9 tile = 512×512 blocks = exactly one Xaero region**. `blackportal.cloud/AtlasTiles/` is autoindexed with whole-map WDL datasets (Overworld/Nether/End; 7k/100k/256k…). 2b2t itself runs 1.21.4; players connect 1.21.4–1.21.8 via ViaVersion → both layouts must work (they do differ only by region major 6 vs 7).
 
-### Sample data (test corpus, `<workspace>/sample data`)
+### Sample data (test corpus, `sample data/` in the surrounding workspace)
 408 MB / 3303 files: 1563 region zips, 1478 .xwmc, 37 DBs, 41 txt. **Built-in merge fixture**: `Multiplayer_2b2t` exists in both version trees with `mw$default` overlap — null 307 vs 90 regions (20 same-name conflicts), DIM-1 296 vs 794 (71), DIM1 0 vs 4. File mtimes preserved by the mod → valid recency signal. Firsthand-verified headers: `ff 00 07 00 08` (1.21.8), `ff 00 06 00 08` (1.21.4); DB schema v1 + metadata (0,1) confirmed via sqlite3.
 
 ---
@@ -224,9 +224,9 @@ De-risking order: codec correctness gates everything; render fidelity is the hig
 
 ## Key reference files
 
-- `<workspace>/XaeroPlus-26.2/common/src/main/java/xaeroplus/feature/highlights/ChunkHighlightDatabase.java` — v2 DDL, pragmas, batching
+- XaeroPlus `common/src/main/java/xaeroplus/feature/highlights/ChunkHighlightDatabase.java` — v2 DDL, pragmas, batching
 - `.../feature/highlights/db/V0ToV1Migration.java`, `V1ToV2Migration.java` — migration semantics to re-implement
 - `.../util/DataFolderResolveUtil.java` — worldId derivation/aliasing; `.../mixin/client/MixinMapSaveLoad.java` — save-path hook
-- `<workspace>/xaeroworldmap-fabric-26.1.2-1.44.2.jar` — `xaero/map/file/MapSaveLoad.class`, `xaero/map/region/MapBlock.class`, `Overlay.class` (bit-packing ground truth for R2 fallback)
-- `<workspace>/coordman-main/coordman.js` — proven Leaflet CRS.Simple setup, zoomOffset-3 Nether overlay, guides
-- `<workspace>/sample data/` — round-trip corpus, merge fixture, v1/v0 DBs, waypoint/dimconfig fixtures
+- `xaeroworldmap-fabric-26.1.2-1.44.2.jar` — `xaero/map/file/MapSaveLoad.class`, `xaero/map/region/MapBlock.class`, `Overlay.class` (bit-packing ground truth for R2 fallback)
+- coordman-main's `coordman.js` — proven Leaflet CRS.Simple setup, zoomOffset-3 Nether overlay, guides
+- `sample data/` — round-trip corpus, merge fixture, v1/v0 DBs, waypoint/dimconfig fixtures
