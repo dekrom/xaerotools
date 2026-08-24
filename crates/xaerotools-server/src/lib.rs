@@ -148,6 +148,10 @@ struct TileKey {
     map: MapId,
     /// Set for highlight-overlay tiles: the XaeroPlus DB filename.
     db: Option<String>,
+    /// Highlight-overlay tiles only: the RGB the rows were painted in. The
+    /// colour is baked into the PNG, so it is part of the tile's identity —
+    /// without it, recolouring an overlay would serve back the old colour.
+    tint: u32,
     z: i32,
     x: i32,
     y: i32,
@@ -1516,6 +1520,45 @@ struct StateJson {
     /// Where region uploads land (per-player backups + merged tree).
     #[serde(rename = "ingestDir")]
     ingest_dir: String,
+    /// The overlay palette, in match order (first `pattern` a DB file name
+    /// contains wins). The viewer needs it for each overlay's label, its
+    /// description and its default colour; it used to keep its own copy,
+    /// which drifted from what the server actually painted.
+    #[serde(rename = "hlPalette")]
+    hl_palette: Vec<HlPaletteJson>,
+}
+
+#[derive(Serialize)]
+struct HlPaletteJson {
+    /// Substring matched against the DB file name.
+    pattern: &'static str,
+    label: &'static str,
+    detection: &'static str,
+    /// `#rrggbb` — what the server paints when the tile URL carries no `c=`.
+    color: String,
+    /// False only for LavaColumns, whose value column is a column height: its
+    /// rows fade by height instead of drawing a flat highlight.
+    #[serde(rename = "isTimestamp")]
+    is_timestamp: bool,
+    /// True when a companion client can stream this module's finds live
+    /// (`POST /ingest/v1/highlights`).
+    syncable: bool,
+}
+
+fn hl_palette_json() -> Vec<HlPaletteJson> {
+    xaero_db::HL_PALETTE
+        .iter()
+        .map(|i| HlPaletteJson {
+            pattern: i.pattern,
+            label: i.label,
+            detection: i.detection,
+            color: format!("#{:02x}{:02x}{:02x}", i.color[0], i.color[1], i.color[2]),
+            is_timestamp: !i.semantics.prefers_max(),
+            syncable: highlights::SYNCABLE
+                .iter()
+                .any(|db| xaero_db::highlight_db_info(db).map(|e| e.pattern) == Some(i.pattern)),
+        })
+        .collect()
 }
 
 #[derive(serde::Serialize)]
@@ -1812,6 +1855,7 @@ async fn api_state(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         caches,
         atlas_dir: st.atlas_dir.as_ref().map(|p| p.display().to_string()),
         ingest_dir: st.ingest_dir.display().to_string(),
+        hl_palette: hl_palette_json(),
     })
 }
 
@@ -2248,6 +2292,7 @@ fn tile_blocking(
         let key = TileKey {
             map: map.clone(),
             db: None,
+            tint: 0, // not a highlight tile
             z,
             x,
             y,
@@ -2308,6 +2353,7 @@ fn tile_blocking(
     let key = TileKey {
         map: map.clone(),
         db: None,
+        tint: 0, // not a highlight tile
         z,
         x,
         y,
@@ -2519,6 +2565,7 @@ fn stale_tile(st: &AppState, map: &MapId, z: i32, x: i32, y: i32) -> Option<Arc<
     let key = TileKey {
         map: map.clone(),
         db: None,
+        tint: 0, // not a highlight tile
         z,
         x,
         y,
@@ -3248,22 +3295,43 @@ fn downscale_box_from(src: &[u8], src_size: usize, dst: usize) -> Vec<u8> {
 /// Overlay color per XaeroPlus database (checked in order: first match wins).
 const HL_ALPHA: u8 = 110;
 
+/// `c=RRGGBB` overrides the overlay colour (a leading `#` is tolerated).
+/// Absent or malformed falls back to the module's palette entry, so a stray
+/// query never costs you the overlay. A *repeated* `c=` is a different matter:
+/// the `Query` extractor rejects it with 400 before the handler runs.
+#[derive(serde::Deserialize)]
+struct HighlightTileQuery {
+    c: Option<String>,
+}
+
+/// Parses `RRGGBB` (a leading `#` tolerated) into a packed 0x00RRGGBB.
+fn parse_tint(raw: Option<&str>) -> Option<u32> {
+    let hex = raw?.trim().trim_start_matches('#');
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
 async fn highlight_tile(
     State(st): State<Arc<AppState>>,
     headers: header::HeaderMap,
+    Query(q): Query<HighlightTileQuery>,
     AxPath((w, db, d, z, x, y)): AxPath<(usize, String, usize, i32, i32, i32)>,
 ) -> Response {
     if !(-16..=0).contains(&z) || db.contains('/') || db.contains('\\') || !db.ends_with(".db") {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let tint = parse_tint(q.c.as_deref());
     let inm: Option<String> = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let result =
-        tokio::task::spawn_blocking(move || highlight_tile_blocking(&st, w, &db, d, z, x, y, inm))
-            .await
-            .unwrap_or(Err("render task failed".into()));
+    let result = tokio::task::spawn_blocking(move || {
+        highlight_tile_blocking(&st, w, &db, d, z, x, y, tint, inm)
+    })
+    .await
+    .unwrap_or(Err("render task failed".into()));
     match result {
         Ok(TileResp::NotModified(etag)) => {
             (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response()
@@ -3287,28 +3355,71 @@ async fn highlight_tile(
     }
 }
 
-fn get_db(st: &AppState, w: usize, db_name: &str) -> Result<(SharedDb, u64), String> {
-    let worlds = st.worlds.read().unwrap().clone();
-    let we = worlds.get(w).ok_or("no such world")?;
-    if !we.world.databases.iter().any(|d| d == db_name) {
-        return Err("no such database".into());
+/// An overlay tile with nothing to draw: this world has no folder for that
+/// dimension, or no copy of that database.
+///
+/// That is data, not a failure. The merged ingest tree gains a dimension only
+/// when someone uploads a *region* for it, while highlight rows for the same
+/// dimension arrive on their own five-second sweep — so the rows routinely
+/// land first. A per-player backup tree may never hold every dimension at all.
+/// Answering those with 500 leaves the overlay dark and the log full; a hole
+/// is what the rest of the map does with data it cannot read.
+///
+/// Stamped with the roots epoch, which is bumped by exactly the rescans that
+/// could supply the missing dimension or database — so the browser revalidates
+/// when that changes and never in between.
+///
+/// The ETag carries no world/dim/db identity on purpose: every empty tile at a
+/// coordinate is the same transparent PNG, so one browser cache entry serves
+/// all of them. `dir_hash = 0` is that shared namespace, and a tile with
+/// something to draw cannot fall into it — its stamp is a file mtime in
+/// epoch-milliseconds while this one is the roots epoch, a counter that starts
+/// at 1 and only advances a step per rescan; the hash of a real database path
+/// is a second, independent separator. If this ever returns anything but
+/// `empty_tile_png()`, it has to hash its identity in the way the drawn path
+/// does. `the_empty_overlay_etag_namespace_stays_separate` guards both halves.
+fn empty_highlight_tile(st: &AppState, z: i32, x: i32, y: i32, inm: &Option<String>) -> TileResp {
+    let etag = tile_etag(0, z, x, y, st.epoch.load(Ordering::Relaxed));
+    if inm_matches(inm, &etag) {
+        TileResp::NotModified(etag)
+    } else {
+        TileResp::Full(None, etag)
     }
-    let wm = we
-        .world
-        .world_map_path
-        .as_ref()
-        .ok_or("no world-map path")?;
+}
+
+/// This world's handle on one XaeroPlus database, with its freshness stamp.
+///
+/// `Ok(None)` is "this world has no copy of it" — see [`empty_highlight_tile`].
+/// `Err` is kept for a database that is there and will not open, which is a
+/// real fault worth reporting.
+///
+/// The caller passes the `WorldEntry` it already resolved rather than us taking
+/// the worlds lock again: `w` is a *positional* index, so a second snapshot
+/// could name a different world than the one whose identity goes into the tile's
+/// ETag, and it costs a lock and an Arc clone per tile to get there.
+fn get_db(
+    st: &AppState,
+    w: usize,
+    we: &WorldEntry,
+    db_name: &str,
+) -> Result<Option<(SharedDb, u64)>, String> {
+    if !we.world.databases.iter().any(|d| d == db_name) {
+        return Ok(None);
+    }
+    let Some(wm) = we.world.world_map_path.as_ref() else {
+        return Ok(None);
+    };
     let path = wm.join(db_name);
     // Live XaeroPlus DBs are WAL-mode: commits touch the -wal file long before
     // the .db, so the freshness stamp must consider both.
     let mtime = config::mtime_ms(&path).max(config::mtime_ms(&wm.join(format!("{db_name}-wal"))));
     let key = (w, db_name.to_string());
     if let Some(db) = st.dbs.lock().unwrap().get(&key) {
-        return Ok((db.clone(), mtime));
+        return Ok(Some((db.clone(), mtime)));
     }
     let db = Arc::new(Mutex::new(xaero_db::open_readonly(&path)?));
     st.dbs.lock().unwrap().insert(key, db.clone());
-    Ok((db, mtime))
+    Ok(Some((db, mtime)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3320,26 +3431,49 @@ fn highlight_tile_blocking(
     z: i32,
     x: i32,
     y: i32,
+    tint: Option<u32>,
     inm: Option<String>,
 ) -> Result<TileResp, String> {
     let worlds = st.worlds.read().unwrap().clone();
-    let we = worlds.get(w).ok_or("no such world")?;
-    let dim = we.world.dims.get(d).ok_or("no such dimension")?;
-    let dim_key = dim
-        .dimension
-        .as_ref()
+    let Some(we) = worlds.get(w) else {
+        return Ok(empty_highlight_tile(st, z, x, y, &inm));
+    };
+    let Some(dim_key) = we
+        .world
+        .dims
+        .get(d)
+        .and_then(|dim| dim.dimension.as_ref())
         .map(|dd| dd.resource_key())
-        .ok_or("dimension has no resource key")?;
+    else {
+        return Ok(empty_highlight_tile(st, z, x, y, &inm));
+    };
 
-    let (db, mtime) = get_db(st, w, db_name)?;
+    let Some((db, mtime)) = get_db(st, w, we, db_name)? else {
+        return Ok(empty_highlight_tile(st, z, x, y, &inm));
+    };
+    // Resolve the colour before it reaches either cache, so an explicit
+    // `c=` that happens to equal the default shares the default's entries
+    // instead of doubling them.
+    let color = tint
+        .map(|c| [(c >> 16) as u8, (c >> 8) as u8, c as u8])
+        .or_else(|| xaero_db::highlight_db_info(db_name).map(|i| i.color))
+        .unwrap_or([0xAA, 0xAA, 0xAA]);
+    let tint = ((color[0] as u32) << 16) | ((color[1] as u32) << 8) | color[2] as u32;
     // The db path hash keeps a positional world index from revalidating
     // another world's overlay after a roots change; the dim index is in the
-    // hash input because the same db serves several dimensions.
+    // hash input because the same db serves several dimensions, and the tint
+    // because it is painted into the bytes.
     let dir_hash = we
         .world
         .world_map_path
         .as_ref()
-        .map(|wm| hash_path(&wm.join(db_name).join(d.to_string())))
+        .map(|wm| {
+            hash_path(
+                &wm.join(db_name)
+                    .join(d.to_string())
+                    .join(format!("{tint:06x}")),
+            )
+        })
         .unwrap_or(0);
     let etag = tile_etag(dir_hash, z, x, y, mtime);
     if inm_matches(&inm, &etag) {
@@ -3354,6 +3488,7 @@ fn highlight_tile_blocking(
             roof: None,
         },
         db: Some(db_name.to_string()),
+        tint,
         z,
         x,
         y,
@@ -3384,9 +3519,6 @@ fn highlight_tile_blocking(
     let encoded = match grid {
         Some(g) if !g.is_empty() => {
             let mut rgba = vec![0u8; TILE * TILE * 4];
-            let color = xaero_db::highlight_db_info(db_name)
-                .map(|i| i.color)
-                .unwrap_or([0xAA, 0xAA, 0xAA]);
             let lava = xaero_db::LavaColumnStyle::default();
             // LavaColumns stores a column height in the `foundTime` column, not
             // a timestamp; drawing every row would paint 92% of the map that
@@ -3446,4 +3578,87 @@ fn encode_png(rgba: &[u8]) -> Result<Vec<u8>, String> {
         w.write_image_data(rgba).map_err(|e| e.to_string())?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_overlay_tint_overrides() {
+        assert_eq!(parse_tint(Some("ff3b30")), Some(0xff_3b_30));
+        assert_eq!(parse_tint(Some("#ff3b30")), Some(0xff_3b_30));
+        assert_eq!(parse_tint(Some(" #FF3B30 ")), Some(0xff_3b_30));
+        assert_eq!(parse_tint(Some("000000")), Some(0));
+        // Anything that is not exactly six hex digits falls back to the
+        // palette colour rather than costing the viewer its overlay.
+        assert_eq!(parse_tint(None), None);
+        assert_eq!(parse_tint(Some("")), None);
+        assert_eq!(parse_tint(Some("fff")), None);
+        assert_eq!(parse_tint(Some("ff3b30a")), None);
+        assert_eq!(parse_tint(Some("gg3b30")), None);
+        assert_eq!(parse_tint(Some("#")), None);
+    }
+
+    #[test]
+    fn the_empty_overlay_etag_namespace_stays_separate() {
+        // `empty_highlight_tile` hashes no world, dimension or database into
+        // its ETag: every empty tile at a coordinate is the same transparent
+        // PNG, so they share one browser cache entry on purpose. Two fields
+        // keep a tile that has something to draw out of that namespace, and
+        // each is checked here on its own, because either alone is enough.
+        let (z, x, y) = (-4, 1, 2);
+        let stamp = 1_750_000_000_000;
+        // 1. dir_hash. Empty tiles use 0; a drawn tile hashes the db path.
+        for info in xaero_db::HL_PALETTE {
+            let path = Path::new("world-map/Multiplayer_2b2t")
+                .join(format!("XaeroPlus{}.db", info.pattern))
+                .join("0")
+                .join("ff3b30");
+            let dir_hash = hash_path(&path);
+            assert_ne!(dir_hash, 0, "{} lands in the empty namespace", info.label);
+            assert_ne!(
+                tile_etag(0, z, x, y, stamp),
+                tile_etag(dir_hash, z, x, y, stamp),
+                "{} shares an ETag with an empty tile of the same stamp",
+                info.label
+            );
+        }
+        // 2. The stamp. An empty tile carries the roots epoch, which starts at
+        // 1 and takes one step per rescan; a drawn tile carries a file mtime
+        // in epoch-milliseconds. Reaching a real mtime would take ~1.7e12
+        // rescans, and the other value an mtime can take — 0, for a file that
+        // vanished under a cached handle — is below the epoch's floor.
+        assert_ne!(tile_etag(0, z, x, y, 1), tile_etag(0, z, x, y, stamp));
+        assert_ne!(tile_etag(0, z, x, y, 1), tile_etag(0, z, x, y, 0));
+    }
+
+    #[test]
+    fn the_palette_the_viewer_gets_is_the_one_it_can_colour_and_sync() {
+        let palette = hl_palette_json();
+        assert_eq!(palette.len(), xaero_db::HL_PALETTE.len());
+        for entry in &palette {
+            // The viewer feeds `color` straight back as `?c=`, which
+            // `parse_tint` reads — so the two have to agree on the format.
+            assert!(parse_tint(Some(&entry.color)).is_some(), "{}", entry.color);
+            // A client pages its finds by a watermark over `foundTime`, so a
+            // module is syncable exactly when that column is a timestamp. The
+            // two `highlights` tests hold SYNCABLE to that from both ends;
+            // this is the flag the viewer actually reads.
+            assert_eq!(
+                entry.syncable, entry.is_timestamp,
+                "{} advertises the wrong sync state",
+                entry.label
+            );
+        }
+        // LavaColumns is the one height-valued module, so it is the one the
+        // viewer must not offer to sync.
+        assert!(palette
+            .iter()
+            .any(|e| e.pattern == "LavaColumns" && !e.syncable && !e.is_timestamp));
+        assert_eq!(
+            palette.iter().filter(|e| e.syncable).count(),
+            palette.len() - 1
+        );
+    }
 }

@@ -1,7 +1,8 @@
 //! Chunk-highlight ingest — the server's own XaeroPlus database.
 //!
 //! `POST /ingest/v1/highlights` takes rows a client's XaeroPlus has just
-//! found — new chunks, old chunks, portals — and merges them into a database
+//! found — new chunks (both detections and their inverses), old/modern chunks,
+//! portals, old biomes, breadcrumb trails — and merges them into a database
 //! the server owns, under `merged/world-map/<world>/XaeroPlus<Kind>.db`. That
 //! tree is already served as a map root, so the rows show up as the ordinary
 //! highlight overlay for that world, and the file stays a valid XaeroPlus v2
@@ -45,22 +46,41 @@ use crate::{now_ms, AppState};
 pub(crate) const BATCH_MAX: usize = 4096;
 /// 4 magic + 1 version + 2 count + BATCH_MAX rows.
 pub(crate) const HIGHLIGHT_BODY_MAX: usize = 7 + BATCH_MAX * 16;
-/// Uploads per second per player.
-const RATE_PER_SEC: f64 = 2.0;
-const RATE_BURST: f64 = 6.0;
+/// Uploads per second per player. A client sweeps every syncable database it
+/// has rows for in one pass, so the burst has to clear a full sweep
+/// (`SYNCABLE.len()`) or the tail of every pass would 429 and retry forever.
+const RATE_PER_SEC: f64 = 4.0;
+const RATE_BURST: f64 = 12.0;
 /// |x|/|z| cap in chunks: the world border with slack.
 const CHUNK_COORD_CAP: u32 = 2_600_000;
 
-/// The databases a client may sync. All three are timestamp-valued and small
-/// enough per session to be worth sharing; the multi-gigabyte palette and
-/// modern-chunk databases are seeded out of band, not streamed.
+/// The databases a client may sync: every known highlight module whose value
+/// column is a **timestamp**.
+///
+/// That is the whole rule, and it is not stylistic. A client pages its finds
+/// by a watermark — "send everything with a `foundTime` above the last one the
+/// server took" — which is a comparison on wall-clock time. `LavaColumns`
+/// stores a column *height* in that column, so a watermark over it would mean
+/// "send every chunk with lava taller than the tallest one you have", which
+/// pages nothing and drops the rest on the floor. It is excluded here, and
+/// `syncable_databases_are_all_timestamp_valued` keeps it that way.
+///
+/// Size is not the criterion. Only rows found since the client's last sweep
+/// travel, so a multi-gigabyte database on disk still streams a handful of
+/// rows a minute; the history in it is seeded out of band, never uploaded.
 pub(crate) const SYNCABLE: &[&str] = &[
     "XaeroPlusNewChunks.db",
+    "XaeroPlusNewChunksLiquidInverse.db",
+    "XaeroPlusPaletteNewChunks.db",
+    "XaeroPlusPaletteNewChunksInverse.db",
     "XaeroPlusOldChunks.db",
+    "XaeroPlusModernChunks.db",
     "XaeroPlusPortals.db",
+    "XaeroPlusOldBiomes.db",
+    "XaeroPlusBreadcrumbs.db",
 ];
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Clone)]
 pub(crate) struct HighlightQuery {
     world: String,
     db: String,
@@ -143,7 +163,11 @@ pub(crate) fn db_path(ingest_dir: &Path, world: &str, db: &str) -> PathBuf {
 
 /// Opens (creating if needed) the server's copy and brings it to XaeroPlus's
 /// v2 shape, so the file is one a game instance would accept verbatim.
-fn open_v2(path: &Path, table: &str) -> Result<Connection, String> {
+///
+/// Also reports whether this call had to create the dimension's table, which
+/// the caller needs: readers snapshot the table list when they open, so one
+/// already cached would keep answering "no such dimension" for the new table.
+fn open_v2(path: &Path, table: &str) -> Result<(Connection, bool), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -158,6 +182,13 @@ fn open_v2(path: &Path, table: &str) -> Result<Connection, String> {
     // highlight tiles hold from blocking these writes.
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
         .map_err(|e| e.to_string())?;
+    let existed: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS metadata (id INTEGER PRIMARY KEY, version INTEGER); \
          INSERT OR REPLACE INTO metadata (id, version) VALUES (0, 2); \
@@ -166,20 +197,21 @@ fn open_v2(path: &Path, table: &str) -> Result<Connection, String> {
         t = xaero_db::quote_ident(table),
     ))
     .map_err(|e| e.to_string())?;
-    Ok(conn)
+    Ok((conn, !existed))
 }
 
-/// Upserts one batch. Returns how many rows were new or moved the value.
+/// Upserts one batch. Returns how many rows were new or moved the value, and
+/// whether the dimension's table had to be created.
 fn store_rows(
     ingest_dir: &Path,
     lock: &std::sync::Mutex<()>,
     q: &HighlightQuery,
     rows: &[HighlightRow],
-) -> Result<usize, (StatusCode, String)> {
+) -> Result<(usize, bool), (StatusCode, String)> {
     let path = db_path(ingest_dir, &q.world, &q.db);
     let prefers_max = xaero_db::highlight_semantics(&q.db).prefers_max();
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let conn = open_v2(&path, &q.dim).map_err(|e| {
+    let (conn, made_table) = open_v2(&path, &q.dim).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("open {}: {e}", q.db),
@@ -205,7 +237,19 @@ fn store_rows(
         Ok(n)
     })()
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")))?;
-    Ok(changed)
+    Ok((changed, made_table))
+}
+
+/// Whether the world list already carries this database under the merged root,
+/// i.e. whether a rescan would still have anything to tell the viewer.
+///
+/// Takes the read guard and drops it before returning, so the caller can hold
+/// the rescan gate across an await without carrying a `std` guard into it.
+fn db_known(st: &AppState, q: &HighlightQuery) -> bool {
+    let root = crate::canon(&st.ingest_dir.join("merged"));
+    st.worlds.read().unwrap().iter().any(|we| {
+        we.root == root && we.world.id == q.world && we.world.databases.iter().any(|d| d == &q.db)
+    })
 }
 
 // --------------------------------------------- POST /ingest/v1/highlights --
@@ -220,7 +264,9 @@ pub(crate) async fn ingest_highlights(
     // The whole point of the channel is a server that is *not* this instance's
     // machine. Locally the server already reads the live databases through a
     // scanned root, so accepting a copy would fork the same data in two.
-    if peer.ip().is_loopback() {
+    // `to_canonical` so an IPv4-mapped IPv6 peer (`::ffff:127.0.0.1`) reads as
+    // loopback here too — the same normalisation the token path uses.
+    if peer.ip().to_canonical().is_loopback() {
         return (
             StatusCode::FORBIDDEN,
             "highlight sync is for remote servers — this one already reads your local databases",
@@ -266,19 +312,43 @@ pub(crate) async fn ingest_highlights(
         Ok(v) => v,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "store task failed").into_response(),
     };
-    let changed = match stored {
-        Ok(n) => n,
+    let (changed, made_table) = match stored {
+        Ok(v) => v,
         Err((code, msg)) => return (code, msg).into_response(),
     };
 
+    if made_table {
+        // A reader caches the table list it saw when it opened, so the first
+        // rows for a dimension the file did not have yet would be invisible
+        // until something else rescanned — fly to the nether and its overlay
+        // stays blank for the rest of the session. Drop the cached handles for
+        // this database (any world's copy of it: reopening one is cheap).
+        // Unconditional, including for a file this call created: a sibling
+        // upload's rescan can publish the new database between its creation
+        // and this table's commit, and a tile served in that window leaves
+        // behind exactly such a stale handle.
+        st.dbs.lock().unwrap().retain(|(_, name), _| name != &q.db);
+    }
+
+    // A database the world did not have is a new overlay: the world list has
+    // to grow before the viewer can ask for its tiles. Re-checked under the
+    // gate, not merely serialized behind it — a client sweeps every syncable
+    // database in one pass, so a fresh merged tree draws a burst of `!existed`
+    // uploads that has to cost one rescan between them, not one each. Same
+    // shape as the region path's `layer_known`.
+    let mut rescanned = false;
     if !existed {
-        // A database the world did not have is a new overlay: the world list
-        // has to grow before the viewer can ask for its tiles.
         let _gate = st.ingest.rescan_gate.lock().await;
-        crate::rescan_roots(&st).await;
-    } else if changed > 0 {
+        if !db_known(&st, &q) {
+            crate::rescan_roots(&st).await;
+            rescanned = true;
+        }
+    }
+    if !rescanned && changed > 0 {
         // Our own write, announced directly rather than waiting on inotify —
-        // the same shortcut region uploads take.
+        // the same shortcut region uploads take. A rescan already told every
+        // viewer; a *coalesced* one told them about the file but not about
+        // rows committed after it, so those uploads announce for themselves.
         let _ = st.live.fs_tx.send(crate::live::FsEvent::Path(db_path(
             &st.ingest_dir,
             &q.world,
@@ -321,6 +391,46 @@ mod tests {
     }
 
     #[test]
+    fn syncable_databases_are_all_timestamp_valued() {
+        // The client pages by a watermark over this column, so a height-valued
+        // database (LavaColumns) can never be in the list. See SYNCABLE.
+        for db in SYNCABLE {
+            assert!(
+                !xaero_db::highlight_semantics(db).prefers_max(),
+                "{db} is not timestamp-valued and cannot be paged by a watermark"
+            );
+            assert!(
+                xaero_db::highlight_db_info(db).is_some(),
+                "{db} has no palette entry, so the viewer could not label or colour it"
+            );
+        }
+        assert!(!SYNCABLE.contains(&"XaeroPlusLavaColumns.db"));
+    }
+
+    #[test]
+    fn every_timestamp_valued_module_is_syncable() {
+        // The regression this guards is the one that shipped: SYNCABLE drifted
+        // behind HL_PALETTE, so a client streaming PaletteNewChunks (and five
+        // others) got 400, set that source `unavailable` for the whole session
+        // and never retried. The overlay was not "stale" on a remote server —
+        // its rows had never once arrived. Anything the viewer can colour and
+        // label, and that pages by a timestamp, has to be accepted here.
+        for info in xaero_db::HL_PALETTE {
+            if info.semantics.prefers_max() {
+                continue; // LavaColumns stores a height; a watermark cannot page it
+            }
+            assert!(
+                SYNCABLE.iter().any(|db| {
+                    xaero_db::highlight_db_info(db).map(|e| e.pattern) == Some(info.pattern)
+                }),
+                "{} is timestamp-valued but missing from SYNCABLE — a client's finds \
+                 for it would be rejected with 400 and dropped for the session",
+                info.label
+            );
+        }
+    }
+
+    #[test]
     fn query_validation_matches_the_syncable_set() {
         let q = |db: &str, dim: &str| HighlightQuery {
             world: "Multiplayer_2b2t".into(),
@@ -329,9 +439,12 @@ mod tests {
         };
         assert!(validate(&q("XaeroPlusNewChunks.db", "minecraft:overworld")).is_ok());
         assert!(validate(&q("XaeroPlusOldChunks.db", "minecraft:the_nether")).is_ok());
-        // Height-valued and multi-gigabyte databases stay out.
+        assert!(validate(&q("XaeroPlusBreadcrumbs.db", "minecraft:overworld")).is_ok());
+        assert!(validate(&q("XaeroPlusPaletteNewChunks.db", "minecraft:overworld")).is_ok());
+        // Height-valued databases stay out — a timestamp watermark cannot page
+        // them — and so does anything not in the allowlist at all.
         assert!(validate(&q("XaeroPlusLavaColumns.db", "minecraft:overworld")).is_err());
-        assert!(validate(&q("XaeroPlusModernChunks.db", "minecraft:overworld")).is_err());
+        assert!(validate(&q("XaeroPlusDrawing.db", "minecraft:overworld")).is_err());
         // A table name has to be a namespaced key, not a path or an injection.
         assert!(validate(&q("XaeroPlusPortals.db", "overworld")).is_err());
         assert!(validate(&q("XaeroPlusPortals.db", "a\"; DROP TABLE x; --")).is_err());
@@ -347,10 +460,30 @@ mod tests {
             db: "XaeroPlusNewChunks.db".into(),
             dim: "minecraft:overworld".into(),
         };
-        assert_eq!(store_rows(&dir, &lock, &q, &[(5, 6, 2000)]).unwrap(), 1);
+        // The first write of a dimension creates its table; later ones do not.
+        assert_eq!(
+            store_rows(&dir, &lock, &q, &[(5, 6, 2000)]).unwrap(),
+            (1, true)
+        );
         // Older sighting of the same chunk wins; the newer one changes nothing.
-        assert_eq!(store_rows(&dir, &lock, &q, &[(5, 6, 1000)]).unwrap(), 1);
-        assert_eq!(store_rows(&dir, &lock, &q, &[(5, 6, 3000)]).unwrap(), 0);
+        assert_eq!(
+            store_rows(&dir, &lock, &q, &[(5, 6, 1000)]).unwrap(),
+            (1, false)
+        );
+        assert_eq!(
+            store_rows(&dir, &lock, &q, &[(5, 6, 3000)]).unwrap(),
+            (0, false)
+        );
+        // A second dimension in the same file reports its table as new, which
+        // is what invalidates readers holding a stale table list.
+        let nether = HighlightQuery {
+            dim: "minecraft:the_nether".into(),
+            ..q.clone()
+        };
+        assert_eq!(
+            store_rows(&dir, &lock, &nether, &[(1, 1, 5000)]).unwrap(),
+            (1, true)
+        );
 
         let path = db_path(&dir, &q.world, &q.db);
         let db = xaero_db::open_readonly(&path).expect("reads back as a highlight db");

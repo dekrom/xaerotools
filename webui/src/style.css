@@ -401,6 +401,85 @@ button:hover {
   display: inline-block;
 }
 
+/* ------------------------------------------------- XaeroPlus overlay rows */
+
+.hl-entry + .hl-entry {
+  margin-top: 2px;
+}
+
+.hl-row {
+  gap: 7px;
+}
+
+.hl-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The swatch is the colour input: a dot the size of the old static one, with
+   the browser's default chrome stripped so it reads as a swatch, not a field. */
+.hl-swatch {
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  flex-shrink: 0;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 50%;
+  background: none;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.hl-swatch::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.hl-swatch::-webkit-color-swatch,
+.hl-swatch::-moz-color-swatch {
+  border: none;
+  border-radius: 50%;
+}
+
+/* Only in the uploaded map — the world in view has no copy of this database. */
+.hl-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 0 4px;
+  opacity: 0.8;
+}
+
+.hl-opts {
+  padding: 1px 0 3px 22px;
+}
+
+.hl-opts input[type='range'] {
+  width: 100%;
+  accent-color: var(--accent);
+  display: block;
+}
+
+.hl-reset {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.hl-reset button {
+  background: var(--bg);
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
 #vault-sync-btn {
   width: 100%;
   font-size: 12px;

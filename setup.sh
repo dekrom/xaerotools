@@ -11,6 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
+die() { printf '\033[1;31m==>\033[0m %s\n' "$*" >&2; exit 1; }
 
 # 1. Rust toolchain (user-local via rustup; no sudo needed).
 if ! command -v cargo >/dev/null 2>&1; then
@@ -31,6 +32,12 @@ if [ "$(uname)" = "Darwin" ] && ! xcode-select -p >/dev/null 2>&1; then
   xcode-select --install || true
   exit 1
 fi
+
+# rustup installs Rust, not a C toolchain: rustc links through cc, and SQLite
+# is compiled from C source (rusqlite "bundled"). A fresh Debian or Fedora box
+# has neither, and the failure there is an opaque "linker `cc` not found".
+command -v cc >/dev/null 2>&1 \
+  || die "no C compiler — install one and re-run: apt install build-essential | dnf groupinstall 'Development Tools' | pacman -S base-devel"
 
 # 2. Build.
 say "building XaeroTools (release)…"

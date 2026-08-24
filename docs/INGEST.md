@@ -135,7 +135,8 @@ Malformed requests are rejected by the framework before auth runs: missing or
 wrong `Content-Type` → 415, invalid JSON syntax → 400, valid JSON with a
 missing field or wrong type → 422.
 
-Anything under `/ingest` other than exactly `POST /ingest/v1/position` is 404.
+Anything under `/ingest` other than a POST to one of the four exact routes in
+this document (`position`, `region`, `preview`, `highlights`) is 404.
 
 ### Rate limit
 
@@ -398,7 +399,8 @@ in place (do **not** clear them — re-fetch and swap):
 
 ## POST /ingest/v1/highlights
 
-Shares the chunks XaeroPlus finds — new chunks, old chunks, portals — with a
+Shares the chunks XaeroPlus finds — new chunks by either detection and their
+inverses, old/modern chunks, portals, old biomes, breadcrumb trails — with a
 server that keeps its **own** database of them. The server merges the rows
 into `merged/world-map/<world>/XaeroPlus<Kind>.db` under its ingest dir, which
 is already served as a map root, so they appear as the ordinary highlight
@@ -424,10 +426,18 @@ Content-Type: application/octet-stream
 ```
 
 - `world` — the world folder the rows belong to, as in region ingest.
-- `db` — the database file name. Exactly one of `XaeroPlusNewChunks.db`,
-  `XaeroPlusOldChunks.db`, `XaeroPlusPortals.db`. The multi-gigabyte palette
-  and modern-chunk databases are seeded out of band, and the height-valued
-  `XaeroPlusLavaColumns.db` is not a stream of sightings, so neither syncs.
+- `db` — the database file name, one of the nine timestamp-valued highlight
+  databases: `XaeroPlusNewChunks.db`, `XaeroPlusNewChunksLiquidInverse.db`,
+  `XaeroPlusPaletteNewChunks.db`, `XaeroPlusPaletteNewChunksInverse.db`,
+  `XaeroPlusOldChunks.db`, `XaeroPlusModernChunks.db`, `XaeroPlusPortals.db`,
+  `XaeroPlusOldBiomes.db`, `XaeroPlusBreadcrumbs.db`.
+
+  `XaeroPlusLavaColumns.db` is **not** syncable and will be refused. Its value
+  column is a lava-column height, not a first-sighting time, so the watermark
+  every client pages by would order it by lava depth and drop nearly every
+  row. Size is not the criterion — only rows found since the client's last
+  sweep travel, so a database that is gigabytes on disk still streams a
+  handful of rows a minute.
 - `dim` — the dimension resource key (`minecraft:the_nether`), which is also
   the table name in the v2 schema.
 
@@ -444,9 +454,11 @@ then count × {
 ### Responses
 
 204 accepted; 400 for a malformed batch, an unsyncable `db`, a bad `dim` key
-or out-of-range chunk coordinates; 403 when the peer is loopback (see above)
-or the token is invalid; 429 over the rate limit (**2 batches/s sustained,
-burst 6** per player — a batch holds 4096 rows).
+or out-of-range chunk coordinates; 403 when the peer is loopback (see above);
+401 when the token is missing or unknown, as for position ingest; 429 over the
+rate limit (**4 batches/s sustained, burst 12** per player — a batch holds 4096
+rows). The burst clears a full sweep of all nine databases, so a client may
+send them back to back.
 
 Rows merge by first sighting: the **oldest** `foundTime` for a chunk wins, so
 re-sending a row the server already has is harmless and changes nothing.
@@ -458,7 +470,16 @@ re-sending a row the server already has is harmless and changes nothing.
   history is what this endpoint exists to avoid.
 - Advance the watermark only on 204, so a failed batch retries.
 - Stop for the session on 403 or 404: the first means the server is not remote,
-  the second that it predates this endpoint. Neither improves on retry.
+  the second that it predates this endpoint. Neither improves on retry. A 401
+  is the token, not the endpoint — stop until the token setting changes, and
+  don't hot-loop it, because the backoff it triggers is server-global.
+- Read each module's cache *field* rather than its public
+  `getHighlightsState`: modules that own both a detection and its inverse
+  (`LiquidNewChunks`, `PaletteNewChunks`, `OldChunks`) resolve that method
+  through the user's render toggle and would hand back whichever of the two is
+  currently being drawn.
+- A module the user has disabled has an empty cache, so nothing is sent for
+  it. Syncing the whole list needs no per-module setting.
 - The reference implementation is the companion addon's `HighlightSync`, which
   reads XaeroPlus's in-memory find cache on the client tick rather than its
   database.

@@ -34,7 +34,13 @@ jobs:
       # a mislabeled build — fail instead.
       - name: Tag must match workspace version
         shell: bash
-        run: grep -q "^version = \"${GITHUB_REF_NAME#v}\"$" Cargo.toml
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          grep -q "^version = \"$want\"$" Cargo.toml || {
+            echo "tag $GITHUB_REF_NAME wants version $want, but Cargo.toml says:"
+            grep -n "^version = " Cargo.toml
+            exit 1
+          }
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -84,6 +90,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+      # A leg that built but never uploaded would publish a release missing a
+      # platform, and nobody finds out until someone goes to download it.
+      - name: Every matrix leg must have landed
+        run: |
+          ls xaerotools-linux-x86_64.zip xaerotools-windows-x86_64.zip \
+             xaerotools-macos-arm64.zip xaerotools-macos-x86_64.zip
       - run: sha256sum *.zip > SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
@@ -91,6 +103,9 @@ jobs:
             *.zip
             SHA256SUMS.txt
           body_path: .github/RELEASE_BODY.md
+          # draft would hide the release from everyone who isn't a maintainer;
+          # fail_on_unmatched_files stops an assetless release being published.
           draft: false
+          fail_on_unmatched_files: true
           make_latest: true
           generate_release_notes: true

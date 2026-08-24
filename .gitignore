@@ -4,3 +4,13 @@ node_modules/
 
 *.log
 .DS_Store
+
+# Ingest credentials and runtime state. docs/INGEST.md tells you to create
+# accounts.txt with one bearer token per line, and the server writes its
+# config, vault and tile pyramid next to it — none of that belongs in a commit.
+accounts.txt
+config.json
+vault.db
+pyramid.db
+*.db-shm
+*.db-wal

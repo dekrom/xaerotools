@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+    # Release only builds and packages — tags run the checks too, so the exact
+    # commit going out has a visible fmt/clippy/test result.
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -12,7 +15,9 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # Half the release matrix is macOS; without it here a macOS-only break
+        # first shows up at tag time and withholds every platform's zip.
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

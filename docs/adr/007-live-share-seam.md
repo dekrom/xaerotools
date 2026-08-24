@@ -7,7 +7,10 @@ the viewer — contract in `docs/INGEST.md`). **Region upload implemented**
 (2026-08: `POST /ingest/v1/region` — decode-validated uploads stored as a
 verbatim per-player backup tree plus a tile-merged shared tree under the
 server's ingest dir, both auto-served as roots; contract in
-`docs/INGEST.md`).
+`docs/INGEST.md`). **Live preview and highlight sync implemented** (2026-08:
+`POST /ingest/v1/preview` carries the terrain a client is seeing before Xaero
+has written it to disk, `POST /ingest/v1/highlights` streams XaeroPlus finds
+row by row into the server's own databases; contracts in `docs/INGEST.md`).
 
 ## Context
 

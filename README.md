@@ -12,11 +12,6 @@
 
 [Setup guide](#get-started) · [Share a map with your friends](#playing-together) · [Something didn't work?](#faq--something-didnt-work)
 
-<img src="assets/viewer.webp" alt="A 2b2t archive in the XaeroTools viewer — spawn and its highway web, with overlays, waypoints, live share and merge tools open" width="900">
-
-*A real 2b2t archive in the viewer: spawn's highway web, XaeroPlus overlays,
-waypoint vault, live share and the merge tools.*
-
 </div>
 
 One small program on your PC. It reads the map folders your game already
@@ -28,21 +23,11 @@ writes and gives you:
 - 🧩 **Safe merging** — combine map folders and XaeroPlus databases without
   losing a tile or touching your originals.
 - 📡 **A live shared map** — see your friends move and map in real time, on
-  one map built from everyone's exploring.
+  one map built from everyone's exploring. Terrain paints in as they travel,
+  seconds before the game has saved it.
 
 No accounts, no telemetry, nothing leaves your machine. The only online
 feature (the 2b2t Atlas overlay) is off until you turn it on.
-
-## The live map in action
-
-<div align="center">
-<img src="assets/demo.gif" alt="Live share: a player runs a nether highway and the shared map paints their surroundings in real time" width="760">
-
-*Following a player down a nether highway — terrain streams onto the shared
-map as they travel, before the game has even saved it.
-([full-quality video](assets/demo.mp4))*
-
-</div>
 
 ## Get started
 
@@ -60,7 +45,7 @@ Pick the one file for your system from the
 | **macOS** — Intel | `xaerotools-macos-x86_64.zip` |
 | **Linux** | `xaerotools-linux-x86_64.zip` |
 
-Not sure which Mac you have?  menu → **About This Mac**. A chip that starts
+Not sure which Mac you have? **Apple menu → About This Mac**. A chip that starts
 with "Apple M" means Apple Silicon; anything saying Intel means Intel.
 
 ### 2. Unzip it
@@ -171,17 +156,21 @@ regions from the 1.12 era that make up most of a long-lived 2b2t map.
 
 - **Coverage view**: instantly see everything you have ever explored.
 - **Instant deep zoom**: a persistent render pyramid means even a 100+ GB
-  archive opens zoomed-out in seconds — every region is decoded once, ever.
+  archive opens zoomed-out in seconds — every region is decoded at most once
+  per version of it on disk, across restarts.
 - **XaeroPlus overlays**: NewChunks, OldChunks, Portals and friends drawn on
-  the map, toggleable per database.
+  the map, toggleable per database — each with its own colour swatch and an
+  opacity slider, plus one button to put the whole panel back to defaults.
+  Your colours travel in the permalink; opacity stays on the screen you set
+  it on.
 - **Waypoints**: searchable (emoji included), with copyable teleport commands.
 - **Nether ⇄ Overworld**: see your nether highways under the overworld at 1:8
   scale, with coordinate conversion.
 - **2b2t Atlas** (optional): overlay 1200+ community-documented locations
   from [2b2tatlas.com](https://2b2tatlas.com), filter by tag, jump to wiki
-  and video links. You can also mirror the Atlas map imagery once with
-  `scripts/atlas-mirror.py` and see it under the parts you haven't explored,
-  served entirely from your own disk.
+  and video links. From a source checkout you can also mirror the Atlas map
+  imagery once with `scripts/atlas-mirror.py` (needs Python 3) and see it
+  under the parts you haven't explored, served entirely from your own disk.
 - Region grid, world border and highway guides, a measure tool, permalinks.
 
 ## Never lose a waypoint again
@@ -414,9 +403,20 @@ panel with click-to-follow, and the merged map filling in as people explore.
 
 Your position, and the map regions your game saves. **Cave layers stay on your
 PC** unless you turn `upload-caves` on, and the host can refuse them outright
-with `--ingest-no-caves`. The addon only ever *reads* your Xaero folder — your
-own local map keeps working exactly as before. Nothing is sent anywhere except
-the server address you typed in.
+with `--ingest-no-caves`.
+
+If you run XaeroPlus, the chunks it finds are shared too — `highlight-sync` is
+**on by default**. That is rows out of nine databases (new chunks by either
+detection and their inverses, old/modern chunks, portals, old biomes and
+breadcrumb trails), so the group map shows everyone's finds and not just your
+own. Only modules you have enabled produce anything, the databases themselves
+never leave your PC — only the rows — and none of it runs against a server on
+your own machine, which reads those databases directly anyway. Turn it off in
+the **XaeroTools** tab if you would rather keep your finds to yourself.
+
+The addon only ever *reads* your Xaero folder — your own local map keeps
+working exactly as before. Nothing is sent anywhere except the server address
+you typed in.
 
 ### If it is not working
 
@@ -512,9 +512,10 @@ live-share client contract in `docs/INGEST.md`.
   old `xaerotools` file. Your settings, tokens and waypoint vault live
   elsewhere (`%APPDATA%\xaerotools` / `~/.local/share/xaerotools`) and are
   kept.
-- **Can I run it on a home server / Raspberry Pi?** Yes, any always-on Linux
-  box works — use the Linux build with `--lan --password`. It is a single
-  binary with no services to install.
+- **Can I run it on a home server / Raspberry Pi?** Yes — any always-on Linux
+  box works, with `--lan --password`. It is a single binary with no services
+  to install. The prebuilt Linux download is x86-64 only, so on an ARM board
+  (a Pi included) build from source instead.
 
 ## Roadmap
 

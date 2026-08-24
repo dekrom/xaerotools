@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/xaero-core", "crates/xaero-db", "crates/xaero-merge", "crates/xaero-scan", "crates/xaerotools-server", "crates/xaerotools-cli", "tools/xaero-colorgen"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 authors = ["XaeroTools contributors"]

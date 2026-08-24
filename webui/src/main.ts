@@ -24,6 +24,7 @@ import {
   AtlasSetJson,
   DbMergeReport,
   DbEvent,
+  HlPaletteJson,
   LiveEvent,
   MergeReport,
   PosEvent,
@@ -63,7 +64,14 @@ let wpFilter = '';
 /** Bumped per reloadWaypoints call so a slow response for one world cannot
  *  land after a switch and paint that world's waypoints on another. */
 let wpReloadGen = 0;
-let hlLayers = new Map<string, L.TileLayer>(); // db filename -> active layer
+/** Active overlay layers, keyed `${worldIndex}|${db}`.
+ *
+ * One ticked overlay can be two layers: the selected world's own copy of the
+ * database, and the merged ingest tree's, which is where companion clients
+ * stream their finds. Those are different world entries, so an overlay drawn
+ * only from the selection shows a frozen archive copy while the live rows
+ * pile up in a world nobody is looking at. */
+let hlLayers = new Map<string, L.TileLayer>();
 let hlEnabled = new Set<string>(); // persists across dim/world switches
 let netherUnderlay: L.TileLayer | null = null;
 let measure: { points: { x: number; z: number }[]; line: L.Polyline | null } | null = null;
@@ -100,26 +108,62 @@ const ATLAS_DATASETS: [string, string, string][] = [
 ];
 const ATLAS_DEFAULT_DIR = '~/.local/share/xaerotools/atlas';
 
-const HL_SWATCHES: [string, string][] = [
-  ['NewChunksLiquidInverse', '#2ab5a0'],
-  ['PaletteNewChunksInverse', '#2ab5a0'],
-  ['PaletteNewChunks', '#ff3b30'],
-  ['NewChunks', '#ff3b30'],
-  ['OldChunks', '#e6c229'],
-  ['ModernChunks', '#58d05b'],
-  ['Portals', '#c678dd'],
-  ['LavaColumns', '#ff8c1a'],
-  ['OldBiomes', '#3d9df2'],
-  ['Breadcrumbs', '#eeeeee'],
-];
+/** The overlay's palette entry, as the server reports it. Nothing here is
+ *  hardcoded any more: the server paints the tiles, so a local copy of the
+ *  colours could only ever drift from what actually lands on the map. */
+function hlInfo(db: string): HlPaletteJson | null {
+  for (const i of state?.hlPalette ?? []) if (db.includes(i.pattern)) return i;
+  return null;
+}
 
-function hlSwatch(db: string): string {
-  for (const [pat, color] of HL_SWATCHES) if (db.includes(pat)) return color;
-  return '#aaaaaa';
+/** The colour this overlay is drawn in: the user's override, else the module's
+ *  default. Always `#rrggbb`, which is what both /hl and <input type=color>
+ *  want. */
+function hlColor(db: string): string {
+  return hlOverrides.get(db) ?? hlInfo(db)?.color ?? '#aaaaaa';
+}
+
+/** 0..1. Applied as layer opacity, so changing it never refetches a tile. */
+function hlOpacity(db: string): number {
+  return hlOpacities.get(db) ?? HL_OPACITY_DEFAULT;
 }
 
 function hlLabel(db: string): string {
   return db.replace(/^XaeroPlus/, '').replace(/\.db$/, '');
+}
+
+const HL_OPACITY_DEFAULT = 0.85;
+/** Per-DB colour overrides, `#rrggbb`. Persisted; a shared link carries them. */
+const hlOverrides = new Map<string, string>();
+const hlOpacities = new Map<string, number>();
+
+/** Stored preferences, entry by entry: a corrupt or hand-edited value is
+ *  dropped rather than allowed to take the overlay panel down with it. */
+function readHlStore(key: string): [string, unknown][] {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? Object.entries(JSON.parse(raw) as Record<string, unknown>) : [];
+  } catch {
+    return []; // storage disabled, or the entry is not JSON: use the defaults
+  }
+}
+
+function loadHlPrefs() {
+  for (const [db, v] of readHlStore('xt-hl-colors')) {
+    if (typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v)) hlOverrides.set(db, v.toLowerCase());
+  }
+  for (const [db, v] of readHlStore('xt-hl-opacity')) {
+    if (typeof v === 'number' && v >= 0 && v <= 1) hlOpacities.set(db, v);
+  }
+}
+
+function saveHlPrefs() {
+  try {
+    localStorage.setItem('xt-hl-colors', JSON.stringify(Object.fromEntries(hlOverrides)));
+    localStorage.setItem('xt-hl-opacity', JSON.stringify(Object.fromEntries(hlOpacities)));
+  } catch {
+    // Private mode / storage full: the session still works, it just forgets.
+  }
 }
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -174,6 +218,13 @@ function readHash(): { sel: Selection; x: number; z: number; zoom: number } | nu
   for (const name of (params.get('hl') ?? '').split(',')) {
     if (name) hlEnabled.add(name.endsWith('.db') ? name : `XaeroPlus${name}.db`);
   }
+  // Colours travel with the link, so a second screen shows the same map. The
+  // opacity does not: that is a per-display comfort setting, not identity.
+  for (const pair of (params.get('hlc') ?? '').split(',')) {
+    const [name, hex] = pair.split(':');
+    if (!name || !/^[0-9a-f]{6}$/i.test(hex ?? '')) continue;
+    hlOverrides.set(name.endsWith('.db') ? name : `XaeroPlus${name}.db`, `#${hex.toLowerCase()}`);
+  }
   const roof = params.get('roof');
   if (roof) {
     const [o, n] = roof.split(',');
@@ -201,6 +252,10 @@ function writeHash() {
   )}/${map.getZoom()}`;
   const params: string[] = [];
   if (hlEnabled.size > 0) params.push(`hl=${[...hlEnabled].map(hlLabel).join(',')}`);
+  if (hlOverrides.size > 0) {
+    const pairs = [...hlOverrides].map(([db, c]) => `${hlLabel(db)}:${c.slice(1)}`);
+    params.push(`hlc=${pairs.join(',')}`);
+  }
   const roofQ = roofQuery();
   if (roofQ) params.push(roofQ.slice(1));
   if (($('toggle-nether') as HTMLInputElement)?.checked) params.push('nether=1');
@@ -1331,10 +1386,17 @@ function handleTilesEvent(ev: TilesEvent) {
 }
 
 function handleDbEvent(ev: DbEvent) {
-  if (ev.w !== sel.w) return;
-  const layer = hlLayers.get(ev.db);
-  // Highlight stamps are mtime-based, fresh at every zoom.
-  if (layer) refreshLayerTiles(layer, null, true, ev.v);
+  // Not gated on sel.w: the database a companion client just wrote belongs to
+  // the merged ingest tree, which is a different world entry from the one in
+  // view. Its layer is keyed by that world, and is exactly the one to refresh.
+  // The event names a world and a database but not a dimension, so ask the
+  // sources: the only layers that exist are theirs.
+  for (const src of hlSources()) {
+    if (src.w !== ev.w) continue;
+    const layer = hlLayers.get(hlKey(src.w, src.d, ev.db));
+    // Highlight stamps are mtime-based, fresh at every zoom.
+    if (layer) refreshLayerTiles(layer, null, true, ev.v);
+  }
 }
 
 function handlePreviewEvent(ev: PreviewEvent) {
@@ -1389,6 +1451,11 @@ async function resyncState() {
       // updateIngestOverlay rebuilds nothing unless its source moved.
       rebuildSidebar();
       updateIngestOverlay();
+      // The world list growing is also how a *new* overlay arrives: the first
+      // breadcrumb or palette row a client ever uploads creates the database
+      // and triggers this rescan. Without this the checkbox for it does not
+      // exist until the page is reloaded.
+      rebuildHighlightPanel();
     } else {
       applySelection(); // rebuilds all tile layers fresh
     }
@@ -2168,45 +2235,208 @@ function applySelection() {
 
 // ------------------------------------------------- XaeroPlus highlight DBs --
 
+/** The merged ingest tree's counterpart of the current *dimension*.
+ *
+ * Not mergedCounterpart(): that resolves a whole map layer and gives up unless
+ * the multiworld and cave layer line up too. A highlight database is keyed by
+ * world and dimension alone — it has no notion of a cave layer — so tying it
+ * to the tile overlay's stricter match would drop the live rows the moment you
+ * looked at a cave. */
+function mergedHlCounterpart(): { w: number; d: number } | null {
+  const w = currentWorld();
+  const folder = currentDim()?.folder;
+  if (!w || !folder || w.origin === 'ingestMerged' || w.origin === 'ingestPlayer') return null;
+  let wi = state.worlds.findIndex((o) => o.origin === 'ingestMerged' && o.id === w.id);
+  if (wi < 0) {
+    wi = state.worlds.findIndex(
+      (o) => o.origin === 'ingestMerged' && worldKey(o.id) === worldKey(w.id)
+    );
+  }
+  if (wi < 0) return null;
+  const di = state.worlds[wi].dims.findIndex((d) => d.folder === folder);
+  return di < 0 ? null : { w: wi, d: di };
+}
+
+/** Where one overlay's rows can live: the world in view, and — when there is
+ *  one — the merged ingest tree companion clients upload into. Both are drawn,
+ *  so a tick shows the archive copy *and* whatever arrived a second ago
+ *  without anyone having to know the difference. */
+function hlSources(): { w: number; d: number; live: boolean }[] {
+  const out = [{ w: sel.w, d: sel.d, live: false }];
+  const merged = mergedHlCounterpart();
+  if (merged) out.push({ w: merged.w, d: merged.d, live: true });
+  return out;
+}
+
+/** The dimension is in the key: the same world's overlay at another dimension
+ *  is a different tile URL, and reusing the key would leave the old one up. */
+function hlKey(w: number, d: number, db: string): string {
+  return `${w}|${d}|${db}`;
+}
+
+/** Rebuilds the overlay list. Only the panel's DOM: the layers themselves are
+ *  reconciled by syncHlLayers, because this runs on every roots rescan — which
+ *  live ingest triggers for each new layer a mapping client discovers — and
+ *  dropping a layer just to recreate an identical one blanks its tiles until
+ *  they reload. */
 function rebuildHighlightPanel() {
-  // Drop all active overlay layers (they are per world+dim).
-  for (const layer of hlLayers.values()) map.removeLayer(layer);
-  hlLayers.clear();
   const list = $('hl-list');
   list.innerHTML = '';
-  const dbs = (currentWorld()?.databases ?? []).filter((d) => !d.includes('Drawing'));
-  setPanelAvailable('hl-panel', dbs.length > 0);
-  for (const db of dbs) {
-    const label = document.createElement('label');
-    label.className = 'row';
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.checked = hlEnabled.has(db);
-    cb.onchange = () => {
-      if (cb.checked) {
-        hlEnabled.add(db);
-        addHlLayer(db);
-      } else {
-        hlEnabled.delete(db);
-        const l = hlLayers.get(db);
-        if (l) map.removeLayer(l);
-        hlLayers.delete(db);
-      }
-    };
-    const dot = document.createElement('span');
-    dot.className = 'dot';
-    dot.style.background = hlSwatch(db);
-    const text = document.createElement('span');
-    text.textContent = hlLabel(db);
-    label.append(cb, dot, text);
-    list.appendChild(label);
-    if (cb.checked) addHlLayer(db);
+  // Union across sources: an overlay the live tree has but the viewed world
+  // does not — the first breadcrumb trail of a session, say — must still get
+  // a row, or there is no way to switch it on.
+  const own = new Set(
+    (currentWorld()?.databases ?? []).filter((d) => !d.includes('Drawing'))
+  );
+  const dbs = new Set(own);
+  const merged = mergedHlCounterpart();
+  for (const db of merged ? state.worlds[merged.w].databases : []) {
+    if (!db.includes('Drawing')) dbs.add(db); // Drawing has its own format
+  }
+  const sorted = [...dbs].sort((a, b) => hlLabel(a).localeCompare(hlLabel(b)));
+  setPanelAvailable('hl-panel', sorted.length > 0);
+  for (const db of sorted) list.appendChild(hlRow(db, !own.has(db)));
+  if (sorted.length > 0) list.appendChild(hlResetRow());
+  syncHlLayers();
+}
+
+/** One overlay's controls: on/off, colour, opacity. */
+function hlRow(db: string, liveOnly: boolean): HTMLElement {
+  const info = hlInfo(db);
+  const wrap = document.createElement('div');
+  wrap.className = 'hl-entry';
+
+  const label = document.createElement('label');
+  label.className = 'row hl-row';
+  label.title = info
+    ? `${info.detection}${info.syncable ? '' : ' — not streamed live'}`
+    : 'Unknown XaeroPlus database';
+
+  // Declared before the checkbox that shows and hides it.
+  const opts = document.createElement('div');
+  opts.className = 'hl-opts';
+  opts.hidden = !hlEnabled.has(db);
+
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = hlEnabled.has(db);
+  cb.onchange = () => {
+    if (cb.checked) hlEnabled.add(db);
+    else hlEnabled.delete(db);
+    syncHlLayers();
+    opts.hidden = !cb.checked;
+    writeHash();
+  };
+
+  // The swatch *is* the colour picker: one control, and it keeps showing the
+  // colour the tiles are actually painted in.
+  const swatch = document.createElement('input');
+  swatch.type = 'color';
+  swatch.className = 'hl-swatch';
+  swatch.value = hlColor(db);
+  swatch.title = 'Overlay colour';
+  // `change`, not `input`: the colour is baked into the PNG server-side, so
+  // every distinct value is a re-render. Dragging through a gradient would
+  // ask for hundreds of them.
+  swatch.onchange = () => {
+    setHlColor(db, swatch.value);
+  };
+  swatch.onclick = (e) => e.stopPropagation(); // the row's label would re-toggle
+
+  const text = document.createElement('span');
+  text.className = 'hl-name';
+  text.textContent = info?.label ?? hlLabel(db);
+
+  label.append(cb, swatch, text);
+  if (liveOnly) {
+    const badge = document.createElement('span');
+    badge.className = 'hl-badge';
+    badge.textContent = 'live';
+    badge.title = 'Only in the uploaded map — this world has no copy of its own';
+    label.appendChild(badge);
+  }
+  wrap.appendChild(label);
+
+  const range = document.createElement('input');
+  range.type = 'range';
+  range.min = '5';
+  range.max = '100';
+  range.step = '5';
+  range.value = String(Math.round(hlOpacity(db) * 100));
+  range.title = 'Opacity';
+  // Opacity is a layer property, not part of the tile, so this one can follow
+  // the drag: nothing is refetched.
+  range.oninput = () => {
+    const v = +range.value / 100;
+    hlOpacities.set(db, v);
+    for (const src of hlSources()) hlLayers.get(hlKey(src.w, src.d, db))?.setOpacity(v);
+  };
+  range.onchange = saveHlPrefs;
+  opts.append(range);
+  wrap.appendChild(opts);
+  return wrap;
+}
+
+function hlResetRow(): HTMLElement {
+  const row = document.createElement('div');
+  row.className = 'hl-reset';
+  const btn = document.createElement('button');
+  btn.textContent = 'Reset colours & opacity';
+  btn.onclick = () => {
+    hlOverrides.clear();
+    hlOpacities.clear();
+    saveHlPrefs();
+    rebuildHighlightPanel();
+    writeHash();
+  };
+  row.appendChild(btn);
+  return row;
+}
+
+function setHlColor(db: string, hex: string) {
+  const value = hex.toLowerCase();
+  if (value === (hlInfo(db)?.color ?? '').toLowerCase()) hlOverrides.delete(db);
+  else hlOverrides.set(db, value);
+  saveHlPrefs();
+  // The colour is part of the tile URL, so the layer has to be rebuilt — but
+  // only this overlay's, and only if it is on screen.
+  for (const src of hlSources()) {
+    const key = hlKey(src.w, src.d, db);
+    const layer = hlLayers.get(key);
+    if (!layer) continue;
+    map.removeLayer(layer);
+    hlLayers.delete(key);
+  }
+  syncHlLayers();
+  writeHash();
+}
+
+/** Brings the live layer set in line with the ticked overlays and the current
+ *  sources, adding and removing only what actually changed — rebuilding a
+ *  layer that did not change blanks its tiles until they reload. */
+function syncHlLayers() {
+  const sources = hlSources();
+  const want = new Map<string, { w: number; d: number; db: string }>();
+  for (const db of hlEnabled) {
+    for (const src of sources) {
+      if (!state.worlds[src.w]?.databases.includes(db)) continue;
+      want.set(hlKey(src.w, src.d, db), { w: src.w, d: src.d, db });
+    }
+  }
+  for (const [key, layer] of hlLayers) {
+    if (want.has(key)) continue;
+    map.removeLayer(layer);
+    hlLayers.delete(key);
+  }
+  for (const [key, o] of want) {
+    if (hlLayers.has(key)) continue;
+    hlLayers.set(key, addHlLayer(o.w, o.d, o.db));
   }
 }
 
-function addHlLayer(db: string) {
-  if (hlLayers.has(db)) return;
-  const layer = L.tileLayer(`./hl/${sel.w}/${db}/${sel.d}/{z}/{x}/{y}`, {
+function addHlLayer(w: number, d: number, db: string): L.TileLayer {
+  const color = hlColor(db).replace('#', '');
+  const layer = L.tileLayer(`./hl/${w}/${db}/${d}/{z}/{x}/{y}?c=${color}`, {
     tileSize: 512,
     minZoom: -16,
     maxZoom: 3,
@@ -2217,11 +2447,11 @@ function addHlLayer(db: string) {
     errorTileUrl: TRANSPARENT_TILE,
     // Chunk-rects must stay crisp over the pixelated base at overzoom.
     className: 'pixelated',
-    opacity: 0.85,
+    opacity: hlOpacity(db),
     zIndex: 5,
   });
   layer.addTo(map);
-  hlLayers.set(db, layer);
+  return layer;
 }
 
 function wireEvents() {
@@ -2587,6 +2817,9 @@ async function boot() {
     renderWelcome();
     return;
   }
+  // Before readHash: a link's colours are the sharper intent and win over
+  // whatever this browser remembered.
+  loadHlPrefs();
   setupMap();
   initPanels();
   const fromHash = readHash();

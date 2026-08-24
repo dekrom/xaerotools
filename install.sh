@@ -11,6 +11,9 @@
 #   ./install.sh --addon          also install the companion addon jar into
 #                                 every detected .minecraft/mods folder
 #   ./install.sh --mods-dir PATH  install the jar into exactly this folder
+#   ./install.sh --mc-version X   use the jar built for Minecraft X instead of
+#                                 reading the version off the instance (needed
+#                                 for the vanilla launcher's shared mods folder)
 #   ./install.sh --uninstall      remove binary/launcher/icon (never map data,
 #                                 never the config, vault or ingest dirs)
 #
@@ -22,12 +25,13 @@ REPO="$PWD"
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m==>\033[0m %s\n' "$*" >&2; exit 1; }
 
-DRY=0 ADDON=0 UNINSTALL=0 MODS_DIR=""
+DRY=0 ADDON=0 UNINSTALL=0 MODS_DIR="" MC_VERSION=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
     --addon) ADDON=1 ;;
     --mods-dir) shift; MODS_DIR="${1:?--mods-dir needs a path}"; ADDON=1 ;;
+    --mc-version) shift; MC_VERSION="${1:?--mc-version needs a version}"; ADDON=1 ;;
     --uninstall) UNINSTALL=1 ;;
     *) die "unknown arg: $1 (see the header of this script)" ;;
   esac
@@ -100,10 +104,46 @@ command -v update-desktop-database >/dev/null 2>&1 \
 
 # 4. Companion addon jar (optional): detected Minecraft instances get a copy.
 if [ "$ADDON" = 1 ]; then
-  jar=$(ls "$REPO/../xaerotools-companion/build/libs/"xaerotools-companion-*.jar \
-           "$REPO/../../meteoraddon/xaerotools-companion/build/libs/"xaerotools-companion-*.jar \
-           "$REPO/../meteoraddon/xaerotools-companion/build/libs/"xaerotools-companion-*.jar 2>/dev/null | head -1 || true)
-  [ -n "$jar" ] || die "companion jar not found — clone github.com/dekrom/xaerotools-companion next to this repo and build it: ./gradlew build"
+  ADDON_ROOT="$REPO/../xaerotools-companion"
+  # The addon is multi-version, so neither Gradle layout is flat:
+  # `./gradlew buildAndCollect` collects every version under
+  # build/libs/<mod version>/, a plain `./gradlew build` leaves the active
+  # node's jars in versions/<mc>/build/libs/. Both put a -sources.jar next to
+  # every real jar; that one has no classes, so Meteor would load nothing from
+  # it — this is ls, not find, so grep it out. LC_ALL=C keeps the order the
+  # same everywhere.
+  jars=$(LC_ALL=C ls "$ADDON_ROOT/build/libs/"*/xaerotools-companion-*+*.jar \
+                     "$ADDON_ROOT/versions/"*/build/libs/xaerotools-companion-*+*.jar \
+                     2>/dev/null | grep -v -- '-sources\.jar$' || true)
+  [ -n "$jars" ] || die "companion jar not found in $ADDON_ROOT — clone github.com/dekrom/xaerotools-companion next to this repo and build it: ./gradlew buildAndCollect"
+
+  # A jar only loads on the Minecraft version it was built against, so the
+  # right one is picked per instance instead of by taking the first of the
+  # pile. The version is the part after '+': <mod ver>+<mc ver>.jar.
+  jar_mc_versions() { printf '%s\n' "$jars" | sed -n 's/.*+\([^+]*\)\.jar$/\1/p' | sort -Vu | paste -sd' ' -; }
+  jar_for_mc() {
+    printf '%s\n' "$jars" | while IFS= read -r j; do
+      case "${j##*/}" in *"+$1.jar") printf '%s\t%s\n' "${j##*/}" "$j" ;; esac
+    done | sort -V | tail -1 | cut -f2   # newest mod version built for it
+  }
+  # Prism/MultiMC record the Minecraft version in the instance metadata beside
+  # the .minecraft folder; the vanilla launcher's shared mods folder does not,
+  # so there --mc-version is the only answer. Prints nothing when unsure.
+  mods_dir_mc() {
+    local inst="${1%/}" out=""
+    inst="${inst%/mods}"; inst="${inst%/.minecraft}"
+    if [ -f "$inst/mmc-pack.json" ]; then
+      # '}' splits the component list one per line, so key order inside a
+      # component does not matter and a nested "requires" block cannot be
+      # mistaken for the Minecraft one — it carries no version of its own.
+      out=$(tr -d ' \t\r\n' < "$inst/mmc-pack.json" | tr '}' '\n' \
+            | sed -n '/"uid":"net\.minecraft"/s/.*"version":"\([^"]*\)".*/\1/p')
+    elif [ -f "$inst/instance.cfg" ]; then
+      out=$(sed -n 's/^IntendedVersion=//p' "$inst/instance.cfg")
+    fi
+    printf '%s\n' "${out%%$'\n'*}"
+  }
+
   if [ -n "$MODS_DIR" ]; then
     mods_dirs=("$MODS_DIR")
   else
@@ -115,10 +155,26 @@ if [ "$ADDON" = 1 ]; then
     done
     [ ${#mods_dirs[@]} -gt 0 ] || die "no mods folder found — pass --mods-dir PATH"
   fi
+  # A folder is skipped rather than guessed at: a jar built for another
+  # Minecraft version does not degrade, Fabric refuses to start with it.
+  installed=0
   for d in "${mods_dirs[@]}"; do
+    mc="$MC_VERSION"
+    [ -n "$mc" ] || mc=$(mods_dir_mc "$d")
+    if [ -z "$mc" ]; then
+      say "skipping $d — cannot tell its Minecraft version; re-run with --mods-dir '$d' --mc-version X (built: $(jar_mc_versions))"
+      continue
+    fi
+    jar=$(jar_for_mc "$mc")
+    if [ -z "$jar" ]; then
+      say "skipping $d — nothing built for Minecraft $mc (built: $(jar_mc_versions))"
+      continue
+    fi
     say "installing addon -> $d/$(basename "$jar")"
     run install -Dm644 "$jar" "$d/$(basename "$jar")"
+    installed=$((installed + 1))
   done
+  [ "$installed" -gt 0 ] || die "no addon jar installed — see the skipped folders above"
 fi
 
 # 5. Verify: the installed binary must actually run on this machine.

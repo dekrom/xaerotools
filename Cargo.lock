@@ -1497,7 +1497,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xaero-colorgen"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "png",
  "serde_json",
@@ -1508,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "xaero-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rayon",
  "smallvec",
@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "xaero-db"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "xaero-merge"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "filetime",
  "rayon",
@@ -1541,14 +1541,14 @@ dependencies = [
 
 [[package]]
 name = "xaero-scan"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "xaero-core",
 ]
 
 [[package]]
 name = "xaerotools"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "png",
  "rayon",
@@ -1563,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "xaerotools-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "futures-util",

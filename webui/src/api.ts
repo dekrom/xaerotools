@@ -43,6 +43,23 @@ export interface AtlasSetJson {
   zMax: number;
 }
 
+/** One XaeroPlus highlight module as the server knows it. The server paints
+ *  the tiles, so this is the authority on an overlay's label and its default
+ *  colour — the UI must not keep a second copy. */
+export interface HlPaletteJson {
+  /** Substring matched against the DB file name; first match wins. */
+  pattern: string;
+  label: string;
+  /** What the module detects, one line. */
+  detection: string;
+  /** "#rrggbb" — what /hl paints when the tile URL carries no `c=`. */
+  color: string;
+  /** False only for LavaColumns, whose rows fade by column height. */
+  isTimestamp: boolean;
+  /** True when companion clients can stream this module's finds live. */
+  syncable: boolean;
+}
+
 export interface StateJson {
   worlds: WorldJson[];
   atlas: AtlasSetJson[];
@@ -52,6 +69,8 @@ export interface StateJson {
   toolsEnabled: boolean;
   /** Where region uploads land (per-player backups + merged tree). */
   ingestDir?: string;
+  /** Overlay palette, in match order. Absent from a pre-0.3 server. */
+  hlPalette?: HlPaletteJson[];
 }
 
 // -------------------------------------------------------------------- atlas --
