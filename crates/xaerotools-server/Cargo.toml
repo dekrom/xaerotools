@@ -21,3 +21,6 @@ xaero-merge = { path = "../xaero-merge" }
 xaero-db = { path = "../xaero-db" }
 getrandom = "0.4.3"
 rusqlite = { version = "0.37", features = ["bundled"] }
+
+[dev-dependencies]
+test-support = { path = "../test-support" }

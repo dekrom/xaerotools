@@ -1,0 +1,5 @@
+[profile.default]
+# Keep running the rest of the suite after a failure, so one broken test
+# doesn't hide the results of every test that would have run after it.
+# (Process-per-test isolation is nextest's own default, not set here.)
+fail-fast = false

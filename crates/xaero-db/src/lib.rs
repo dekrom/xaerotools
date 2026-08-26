@@ -651,18 +651,10 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    pub(crate) fn corpus_root() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("XAERO_CORPUS") {
-            let p = PathBuf::from(p);
-            return p.is_dir().then_some(p);
-        }
-        let fallback = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../sample data");
-        fallback.is_dir().then(|| fallback.canonicalize().unwrap())
-    }
-
     #[test]
+    #[ignore = "requires corpus (XAERO_CORPUS)"]
     fn reads_sample_newchunks() {
-        let Some(root) = corpus_root() else { return };
+        let root = test_support::corpus_root().expect("XAERO_CORPUS");
         let db = open_readonly(
             &root.join("xaero1.21.8/world-map/Multiplayer_2b2t/XaeroPlusNewChunks.db"),
         )
@@ -679,8 +671,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires corpus (XAERO_CORPUS)"]
     fn reads_all_sample_dbs() {
-        let Some(root) = corpus_root() else { return };
+        let root = test_support::corpus_root().expect("XAERO_CORPUS");
         let mut checked = 0;
         for version_dir in ["xaero1.21.4", "xaero1.21.8"] {
             let wm = root.join(version_dir).join("world-map");

@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 xaero-core = { path = "../xaero-core" }
+
+[dev-dependencies]
+test-support = { path = "../test-support" }

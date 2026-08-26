@@ -167,11 +167,9 @@ fn legacy_regions_re_encode_to_modern_and_survive_a_round_trip() {
 
 /// Opt-in sweep over a private archive: every region must decode to exact EOF.
 #[test]
+#[ignore = "requires XAERO_LEGACY_CORPUS"]
 fn optional_corpus_decodes_to_exact_eof() {
-    let Ok(dir) = std::env::var("XAERO_LEGACY_CORPUS") else {
-        eprintln!("XAERO_LEGACY_CORPUS unset — skipping");
-        return;
-    };
+    let dir = std::env::var("XAERO_LEGACY_CORPUS").expect("XAERO_LEGACY_CORPUS");
     let mut checked = 0usize;
     let mut exact = 0usize;
     let mut by_version: std::collections::BTreeMap<String, usize> = Default::default();

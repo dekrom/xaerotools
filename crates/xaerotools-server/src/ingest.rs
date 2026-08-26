@@ -428,21 +428,10 @@ mod tests {
         );
     }
 
-    fn corpus_root() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("XAERO_CORPUS") {
-            let p = PathBuf::from(p);
-            return p.is_dir().then_some(p);
-        }
-        let fallback = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../sample data");
-        fallback.is_dir().then(|| fallback.canonicalize().unwrap())
-    }
-
     #[test]
+    #[ignore = "requires corpus (XAERO_CORPUS)"]
     fn stores_backup_and_merges_shared_from_corpus() {
-        let Some(root) = corpus_root() else {
-            eprintln!("corpus not found; skipping");
-            return;
-        };
+        let root = test_support::corpus_root().expect("XAERO_CORPUS");
         // Two real copies of the same coordinate: major-6 (1.21.4) and
         // major-7 (1.21.8) — a genuine cross-version merge.
         let a = std::fs::read(

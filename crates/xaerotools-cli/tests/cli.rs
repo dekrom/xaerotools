@@ -11,19 +11,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn corpus_root() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("XAERO_CORPUS") {
-        let p = PathBuf::from(p);
-        return p.is_dir().then_some(p);
-    }
-    let fallback = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../sample data");
-    fallback.is_dir().then(|| fallback.canonicalize().unwrap())
-}
-
 /// The 1.21.8 half of the corpus: one world with a 4-region End dimension.
-fn corpus_root_1218() -> Option<PathBuf> {
-    let p = corpus_root()?.join("xaero1.21.8");
-    p.is_dir().then_some(p)
+fn corpus_root_1218() -> PathBuf {
+    test_support::corpus_root()
+        .expect("XAERO_CORPUS")
+        .join("xaero1.21.8")
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -51,11 +43,9 @@ fn read_png(path: &Path) -> (u32, u32, Vec<u8>) {
 }
 
 #[test]
+#[ignore = "requires corpus (XAERO_CORPUS)"]
 fn render_stitch_matches_render_region() {
-    let Some(root) = corpus_root_1218() else {
-        eprintln!("skipping: sample corpus not found");
-        return;
-    };
+    let root = corpus_root_1218();
     let dir = scratch("render");
     let stitched = dir.join("end.png");
     let single = dir.join("region.png");
@@ -100,11 +90,9 @@ fn render_stitch_matches_render_region() {
 }
 
 #[test]
+#[ignore = "requires corpus (XAERO_CORPUS)"]
 fn render_refuses_an_oversized_box() {
-    let Some(root) = corpus_root_1218() else {
-        eprintln!("skipping: sample corpus not found");
-        return;
-    };
+    let root = corpus_root_1218();
     let dir = scratch("cap");
     let out = xt(&[
         "render",
@@ -167,11 +155,9 @@ fn render_leaves_a_hole_for_a_region_it_cannot_decode() {
 }
 
 #[test]
+#[ignore = "requires corpus (XAERO_CORPUS)"]
 fn stats_json_describes_the_corpus() {
-    let Some(root) = corpus_root_1218() else {
-        eprintln!("skipping: sample corpus not found");
-        return;
-    };
+    let root = corpus_root_1218();
     let out = xt(&[
         "stats",
         "--root",
@@ -221,11 +207,9 @@ fn stats_json_describes_the_corpus() {
 }
 
 #[test]
+#[ignore = "requires corpus (XAERO_CORPUS)"]
 fn doctor_is_quiet_on_a_healthy_corpus() {
-    let Some(root) = corpus_root_1218() else {
-        eprintln!("skipping: sample corpus not found");
-        return;
-    };
+    let root = corpus_root_1218();
     let out = xt(&[
         "doctor",
         "--root",

@@ -16,16 +16,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rayon::prelude::*;
 use xaero_core::{decode_region, encode_region, read_region_container};
 
-fn corpus_root() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("XAERO_CORPUS") {
-        let p = PathBuf::from(p);
-        return p.is_dir().then_some(p);
-    }
-    // repo layout: <XaeroTools>/xaerotools/crates/xaero-core ; corpus at <XaeroTools>/sample data
-    let fallback = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../sample data");
-    fallback.is_dir().then(|| fallback.canonicalize().unwrap())
-}
-
 fn is_region_file(path: &Path) -> bool {
     if path.extension().and_then(|e| e.to_str()) != Some("zip") {
         return false;
@@ -48,11 +38,9 @@ fn in_cache_dir(path: &Path) -> bool {
 }
 
 #[test]
+#[ignore = "requires corpus (XAERO_CORPUS)"]
 fn corpus_round_trip() {
-    let Some(root) = corpus_root() else {
-        eprintln!("corpus not found; set XAERO_CORPUS to run this test");
-        return;
-    };
+    let root = test_support::corpus_root().expect("XAERO_CORPUS");
     let mut files: Vec<PathBuf> = walkdir::WalkDir::new(&root)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -160,10 +148,9 @@ fn corpus_round_trip() {
 }
 
 #[test]
+#[ignore = "requires corpus (XAERO_CORPUS)"]
 fn truncation_never_panics() {
-    let Some(root) = corpus_root() else {
-        return;
-    };
+    let root = test_support::corpus_root().expect("XAERO_CORPUS");
     // One small region per major version.
     let picks = [
         "xaero1.21.4/world-map/Multiplayer_2b2t/DIM-1/mw$default/0_-24.zip",

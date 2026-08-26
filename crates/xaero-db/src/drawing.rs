@@ -685,10 +685,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires corpus (XAERO_CORPUS)"]
     fn reads_corpus_drawing_dbs() {
-        let Some(root) = crate::tests::corpus_root() else {
-            return;
-        };
+        let root = test_support::corpus_root().expect("XAERO_CORPUS");
         let mut checked = 0;
         for version_dir in ["xaero1.21.4", "xaero1.21.8"] {
             let wm = root.join(version_dir).join("world-map");
