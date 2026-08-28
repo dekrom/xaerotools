@@ -8,6 +8,15 @@
 
 use super::{Eof, Rd};
 
+/// Max value of the recursion-depth counter before the skimmer treats the
+/// input as corrupt. The counter increments on every recursive call, and
+/// compound nesting recurses twice per level (`skim_compound` ->
+/// `skim_payload` -> `skim_compound`), so the real bound on compound nesting
+/// is ~256 levels (~512 for lists, which recurse once per level). Real
+/// Minecraft block-state NBT nests only a few levels; either bound is far
+/// above legitimate depth and far below a stack-overflow (~10k).
+const MAX_NBT_DEPTH: u32 = 512;
+
 pub const TAG_END: u8 = 0;
 pub const TAG_BYTE: u8 = 1;
 pub const TAG_SHORT: u8 = 2;
@@ -40,9 +49,9 @@ pub(crate) fn read_named_nbt(rd: &mut Rd<'_>) -> Result<RawNbt, Eof> {
         let name_len = rd.u16()? as usize;
         rd.take(name_len)?;
         if tag == TAG_COMPOUND {
-            name = skim_compound(rd, true)?;
+            name = skim_compound(rd, true, 0)?;
         } else {
-            skim_payload(rd, tag)?;
+            skim_payload(rd, tag, 0)?;
         }
     }
     Ok(RawNbt {
@@ -53,7 +62,10 @@ pub(crate) fn read_named_nbt(rd: &mut Rd<'_>) -> Result<RawNbt, Eof> {
 
 /// Skims a compound payload; when `want_name`, returns the value of the
 /// first top-level "Name" string entry found.
-fn skim_compound(rd: &mut Rd<'_>, want_name: bool) -> Result<Option<String>, Eof> {
+fn skim_compound(rd: &mut Rd<'_>, want_name: bool, depth: u32) -> Result<Option<String>, Eof> {
+    if depth > MAX_NBT_DEPTH {
+        return Err(Eof);
+    }
     let mut found: Option<String> = None;
     loop {
         let tag = rd.u8()?;
@@ -67,12 +79,15 @@ fn skim_compound(rd: &mut Rd<'_>, want_name: bool) -> Result<Option<String>, Eof
             let bytes = rd.take(len)?;
             found = Some(decode_java_utf(bytes));
         } else {
-            skim_payload(rd, tag)?;
+            skim_payload(rd, tag, depth + 1)?;
         }
     }
 }
 
-fn skim_payload(rd: &mut Rd<'_>, tag: u8) -> Result<(), Eof> {
+fn skim_payload(rd: &mut Rd<'_>, tag: u8, depth: u32) -> Result<(), Eof> {
+    if depth > MAX_NBT_DEPTH {
+        return Err(Eof);
+    }
     match tag {
         TAG_BYTE => {
             rd.take(1)?;
@@ -99,11 +114,11 @@ fn skim_payload(rd: &mut Rd<'_>, tag: u8) -> Result<(), Eof> {
             let n = rd.i32()?;
             let n = usize::try_from(n).unwrap_or(0);
             for _ in 0..n {
-                skim_payload(rd, elem)?;
+                skim_payload(rd, elem, depth + 1)?;
             }
         }
         TAG_COMPOUND => {
-            skim_compound(rd, false)?;
+            skim_compound(rd, false, depth + 1)?;
         }
         TAG_INT_ARRAY => {
             let n = rd.i32()?;
@@ -237,6 +252,32 @@ mod tests {
     #[test]
     fn truncated_nbt_is_eof() {
         let raw = [0x0A, 0x00, 0x00, 0x08, 0x00, 0x04, b'N'];
+        let mut rd = Rd::new(&raw);
+        assert!(read_named_nbt(&mut rd).is_err());
+    }
+
+    // Nested empty compounds; read_named_nbt takes the first as the root tag.
+    fn nested_compounds(depth: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for _ in 0..depth {
+            bytes.extend_from_slice(&[0x0A, 0x00, 0x00]); // TAG_Compound, name_len=0
+        }
+        bytes.resize(bytes.len() + depth, 0x00); // depth trailing TAG_End bytes
+        bytes
+    }
+
+    #[test]
+    fn shallow_nbt_still_parses() {
+        let raw = nested_compounds(10);
+        let mut rd = Rd::new(&raw);
+        assert!(read_named_nbt(&mut rd).is_ok());
+    }
+
+    #[test]
+    fn deep_nbt_is_capped_not_overflowed() {
+        // 600 > MAX_NBT_DEPTH(512): well-formed, would parse Ok without a cap;
+        // with the cap it must return Eof (bounded, never reaches an overflow).
+        let raw = nested_compounds(600);
         let mut rd = Rd::new(&raw);
         assert!(read_named_nbt(&mut rd).is_err());
     }
