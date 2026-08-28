@@ -64,6 +64,13 @@ vault backup of every account's waypoints.
     --skip optional_corpus_decodes_to_exact_eof
   ```
 
+  Or under nextest, which is what CI runs:
+
+  ```
+  XAERO_CORPUS=/path/to/sample-data cargo nextest run --workspace \
+    --run-ignored ignored-only -- --skip optional_corpus_decodes_to_exact_eof
+  ```
+
   Without `XAERO_CORPUS` they stop with an error rather than passing quietly.
   The `--skip` excludes one sweep over a **private** legacy archive that is not
   part of the public corpus; drop it if you have set `XAERO_LEGACY_CORPUS`.

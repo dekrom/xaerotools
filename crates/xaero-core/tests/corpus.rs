@@ -159,9 +159,16 @@ fn truncation_never_panics() {
     ];
     for rel in picks {
         let path = root.join(rel);
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
+        // Reading these two is the whole test. Skipping a missing one leaves
+        // the loop body unexecuted and the test green, so name it and stop.
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "corpus pick is missing: {} ({e}). If the corpus layout moved, \
+                 update the pick rather than letting this test pass without \
+                 decoding anything.",
+                path.display()
+            )
+        });
         let stream = read_region_container(&bytes).unwrap();
         for cut in 0..stream.len().min(4000) {
             let _ = decode_region(&stream[..cut]);

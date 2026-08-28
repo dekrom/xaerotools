@@ -168,6 +168,10 @@ fn legacy_regions_re_encode_to_modern_and_survive_a_round_trip() {
 }
 
 /// Opt-in sweep over a private archive: every region must decode to exact EOF.
+///
+/// The name below is quoted in `docs/START-HERE.md` and in the panic message,
+/// because running the ignored set against the public corpus alone means
+/// excluding this one by name. Renaming it means updating both.
 #[test]
 #[ignore = "requires XAERO_LEGACY_CORPUS"]
 fn optional_corpus_decodes_to_exact_eof() {
