@@ -7,7 +7,9 @@
 //! (0.4 and 0.7).
 //!
 //! Point `XAERO_LEGACY_CORPUS` at a directory of region zips to run the same
-//! assertions across a larger private archive; the test is a no-op without it.
+//! assertions across a larger private archive. That sweep is `#[ignore]`d, so
+//! it never runs by accident, and it stops with a clear error rather than
+//! reporting a pass when the archive is absent.
 
 use std::path::{Path, PathBuf};
 
@@ -169,7 +171,15 @@ fn legacy_regions_re_encode_to_modern_and_survive_a_round_trip() {
 #[test]
 #[ignore = "requires XAERO_LEGACY_CORPUS"]
 fn optional_corpus_decodes_to_exact_eof() {
-    let dir = std::env::var("XAERO_LEGACY_CORPUS").expect("XAERO_LEGACY_CORPUS");
+    let dir = test_support::legacy_corpus_root().unwrap_or_else(|| {
+        panic!(
+            "XAERO_LEGACY_CORPUS is unset. This sweep reads a private archive \
+             that is not part of the public sample corpus, so `--ignored` on \
+             the public data alone cannot satisfy it. Either set the variable, \
+             or exclude this one test with \
+             `--skip optional_corpus_decodes_to_exact_eof`."
+        )
+    });
     let mut checked = 0usize;
     let mut exact = 0usize;
     let mut by_version: std::collections::BTreeMap<String, usize> = Default::default();
@@ -205,6 +215,10 @@ fn optional_corpus_decodes_to_exact_eof() {
         *by_version.entry(dr.version.to_string()).or_default() += 1;
         checked += 1;
     }
-    assert!(checked > 0, "corpus dir {dir} had no region zips");
+    assert!(
+        checked > 0,
+        "corpus dir {} had no region zips",
+        dir.display()
+    );
     eprintln!("decoded {checked} regions cleanly ({exact} byte-identical): {by_version:?}");
 }

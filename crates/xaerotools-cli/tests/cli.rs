@@ -3,8 +3,8 @@
 //! `render` is asserted pixel-for-pixel against `render-region` so the stitch
 //! path can never silently drift from the single-region renderer, and `doctor`
 //! is pointed at a scratch tree of deliberately broken files. The corpus lives
-//! outside the repo; corpus tests are skipped (with a notice) when it is
-//! absent. Override with XAERO_CORPUS=/path/to/sample-data.
+//! outside the repo; the corpus tests are `#[ignore]`d, so they report as
+//! skipped and never as passed. Point XAERO_CORPUS at a copy to run them.
 //!
 //! Nothing here ever writes inside the corpus.
 

@@ -1,4 +1,5 @@
-//! Parser checks against the real sample corpus (skipped when absent).
+//! Parser checks against the real sample corpus. `#[ignore]`d, so they report
+//! as skipped rather than as passed when XAERO_CORPUS is unset.
 
 use xaero_core::dimconfig::{parse_dimension_config, parse_minimap_config};
 use xaero_core::waypoints::parse_waypoints_file;

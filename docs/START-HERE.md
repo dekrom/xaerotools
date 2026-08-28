@@ -52,12 +52,21 @@ vault backup of every account's waypoints.
 
 ## Developing
 
-- `cargo test --workspace` — the full suite. The byte-identical codec
-  round-trip runs against the 2b2t sample corpus, which is not part of this
-  repo: point `XAERO_CORPUS` at a copy
-  (`XAERO_CORPUS=/path/to/sample-data cargo test --workspace`). Without it
-  those tests **skip rather than fail**, so a green run does not by itself
-  prove the corpus was read.
+- `cargo test --workspace` — the full suite. The corpus-backed tests (the
+  byte-identical codec round-trip and friends) are `#[ignore]`d, so this run
+  reports them as **skipped**, never as passed. A green run therefore makes no
+  claim about the corpus either way.
+- To actually run them, point `XAERO_CORPUS` at a copy of the 2b2t sample
+  corpus, which is not part of this repo, and ask for the ignored tests:
+
+  ```
+  XAERO_CORPUS=/path/to/sample-data cargo test --workspace -- --ignored \
+    --skip optional_corpus_decodes_to_exact_eof
+  ```
+
+  Without `XAERO_CORPUS` they stop with an error rather than passing quietly.
+  The `--skip` excludes one sweep over a **private** legacy archive that is not
+  part of the public corpus; drop it if you have set `XAERO_LEGACY_CORPUS`.
 - If you change the web UI: `cd webui && npm install && npm run build`, then
   `cargo clean -p xaerotools-server && cargo build` (the UI is embedded at
   compile time).

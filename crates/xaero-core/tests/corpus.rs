@@ -7,8 +7,9 @@
 //!    7.8 share the same body layout), and survive decode(encode(x)) with
 //!    semantic equality
 //!
-//! The corpus lives outside the repo; the test is skipped (with a notice)
-//! when it cannot be found. Override with XAERO_CORPUS=/path/to/sample-data.
+//! The corpus lives outside the repo. These tests are `#[ignore]`d, so a plain
+//! `cargo test` reports them as skipped and never as passed. Run them with
+//! `--ignored` and XAERO_CORPUS=/path/to/sample-data.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
