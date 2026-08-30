@@ -3,18 +3,7 @@
 //! overlap — null 307 vs 90 regions (20 conflicts), DIM-1 296 vs 794 (71),
 //! DIM1 0 vs 4. Expected merged totals: null 377, DIM-1 1019, DIM1 4.
 
-use std::path::{Path, PathBuf};
-
 use xaero_merge::{merge_to_output, MergeOptions};
-
-fn corpus_root() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("XAERO_CORPUS") {
-        let p = PathBuf::from(p);
-        return p.is_dir().then_some(p);
-    }
-    let fallback = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../sample data");
-    fallback.is_dir().then(|| fallback.canonicalize().unwrap())
-}
 
 fn unit<'a>(
     report: &'a xaero_merge::MergeReport,
@@ -29,11 +18,9 @@ fn unit<'a>(
 }
 
 #[test]
+#[ignore = "requires corpus (XAERO_CORPUS)"]
 fn merges_the_2b2t_fixture() {
-    let Some(root) = corpus_root() else {
-        eprintln!("corpus not found; skipping");
-        return;
-    };
+    let root = test_support::corpus_root().expect("XAERO_CORPUS");
     let a = root.join("xaero1.21.4");
     let b = root.join("xaero1.21.8");
     let out = std::env::temp_dir().join(format!("xt-merge-fixture-{}", std::process::id()));

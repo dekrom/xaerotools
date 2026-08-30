@@ -13,3 +13,6 @@ xaero-db = { path = "../xaero-db" }
 xaero-merge = { path = "../xaero-merge" }
 xaero-scan = { path = "../xaero-scan" }
 xaerotools-server = { path = "../xaerotools-server" }
+
+[dev-dependencies]
+test-support = { path = "../test-support" }

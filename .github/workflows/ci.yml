@@ -27,8 +27,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace -- -D warnings
-      # Corpus-driven tests skip gracefully when the sample data is absent.
-      - run: cargo test --workspace
+      # Corpus/archive tests are #[ignore]d and need real data; run with --ignored locally.
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace
+      - run: cargo test --workspace --doc
 
   wasm-core:
     runs-on: ubuntu-latest
@@ -52,3 +54,34 @@ jobs:
         working-directory: webui
       - run: npm run build
         working-directory: webui
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      # Instrumented builds use different RUSTFLAGS, so they get their own cache key.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: llvm-cov
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
+      - run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
+      - run: cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
+  no-silent-skips:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail if a test silently returns on missing corpus
+        run: |
+          if grep -rEn 'corpus_root\(\)\s*else\s*\{|(std::)?env::var\("XAERO_[A-Z_]*CORPUS"\)\s*else\s*\{' crates; then
+            echo "::error::Found a silent corpus/env else-skip. Use #[ignore] + .expect(), not a silent return."
+            exit 1
+          fi
