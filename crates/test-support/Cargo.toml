@@ -1,0 +1,9 @@
+[package]
+name = "test-support"
+version.workspace = true
+edition = "2021"
+publish = false
+
+[dependencies]
+xaero-core = { path = "../xaero-core" }
+tempfile = "3"

@@ -8,10 +8,14 @@
 
 use super::{Eof, Rd};
 
-/// Nesting limit, the same 512 `NbtIo` enforces. Deeper input is corrupt (or
-/// hostile: a nested list costs five bytes a level), and recursing into it
-/// would overflow the stack long before the stream ran out.
-const MAX_DEPTH: u32 = 512;
+/// Max value of the recursion-depth counter before the skimmer treats the
+/// input as corrupt. The counter increments on every recursive call, and
+/// compound nesting recurses twice per level (`skim_compound` ->
+/// `skim_payload` -> `skim_compound`), so the real bound on compound nesting
+/// is ~256 levels (~512 for lists, which recurse once per level). Real
+/// Minecraft block-state NBT nests only a few levels; either bound is far
+/// above legitimate depth and far below a stack-overflow (~10k).
+const MAX_NBT_DEPTH: u32 = 512;
 
 pub const TAG_END: u8 = 0;
 pub const TAG_BYTE: u8 = 1;
@@ -59,7 +63,7 @@ pub(crate) fn read_named_nbt(rd: &mut Rd<'_>) -> Result<RawNbt, Eof> {
 /// Skims a compound payload; when `want_name`, returns the value of the
 /// first top-level "Name" string entry found.
 fn skim_compound(rd: &mut Rd<'_>, want_name: bool, depth: u32) -> Result<Option<String>, Eof> {
-    if depth > MAX_DEPTH {
+    if depth > MAX_NBT_DEPTH {
         return Err(Eof);
     }
     let mut found: Option<String> = None;
@@ -81,7 +85,7 @@ fn skim_compound(rd: &mut Rd<'_>, want_name: bool, depth: u32) -> Result<Option<
 }
 
 fn skim_payload(rd: &mut Rd<'_>, tag: u8, depth: u32) -> Result<(), Eof> {
-    if depth > MAX_DEPTH {
+    if depth > MAX_NBT_DEPTH {
         return Err(Eof);
     }
     match tag {
@@ -252,23 +256,43 @@ mod tests {
         assert!(read_named_nbt(&mut rd).is_err());
     }
 
-    /// Lists nested a hundred thousand deep must come back as an error, not
-    /// as a stack overflow: five bytes a level is cheap for an attacker.
-    #[test]
-    fn absurd_nesting_is_rejected() {
-        let mut raw = vec![0x0A, 0x00, 0x00, 0x09, 0x00, 0x01, b'l'];
-        for _ in 0..100_000 {
-            // TAG_List of one TAG_List
-            raw.extend_from_slice(&[0x09, 0x00, 0x00, 0x00, 0x01]);
+    // Nested empty compounds; read_named_nbt takes the first as the root tag.
+    fn nested_compounds(depth: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for _ in 0..depth {
+            bytes.extend_from_slice(&[0x0A, 0x00, 0x00]); // TAG_Compound, name_len=0
         }
-        raw.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        bytes.resize(bytes.len() + depth, 0x00); // depth trailing TAG_End bytes
+        bytes
+    }
+
+    #[test]
+    fn shallow_nbt_still_parses() {
+        let raw = nested_compounds(10);
+        let mut rd = Rd::new(&raw);
+        assert!(read_named_nbt(&mut rd).is_ok());
+    }
+
+    #[test]
+    fn deep_nbt_is_capped_not_overflowed() {
+        // 600 > MAX_NBT_DEPTH(512): well-formed, would parse Ok without a cap;
+        // with the cap it must return Eof (bounded, never reaches an overflow).
+        let raw = nested_compounds(600);
         let mut rd = Rd::new(&raw);
         assert!(read_named_nbt(&mut rd).is_err());
+    }
 
-        let mut raw = vec![0x0A, 0x00, 0x00];
+    /// Lists are the cheap way in: one nested level costs five bytes, so a
+    /// hostile region can bury a hundred thousand of them in half a megabyte.
+    /// They recurse through a different arm than compounds and must be capped
+    /// there too.
+    #[test]
+    fn deep_lists_are_capped_not_overflowed() {
+        let mut raw = vec![0x0A, 0x00, 0x00, 0x09, 0x00, 0x01, b'l'];
         for _ in 0..100_000 {
-            raw.extend_from_slice(&[0x0A, 0x00, 0x00]); // nested compound, empty name
+            raw.extend_from_slice(&[0x09, 0x00, 0x00, 0x00, 0x01]); // TAG_List of one
         }
+        raw.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
         let mut rd = Rd::new(&raw);
         assert!(read_named_nbt(&mut rd).is_err());
     }

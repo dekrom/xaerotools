@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/xaero-core", "crates/xaero-db", "crates/xaero-merge", "crates/xaero-scan", "crates/xaero-zvcr", "crates/xaerotools-server", "crates/xaerotools-cli", "tools/xaero-colorgen"]
+members = ["crates/xaero-core", "crates/xaero-db", "crates/xaero-merge", "crates/xaero-scan", "crates/xaero-zvcr", "crates/xaerotools-server", "crates/xaerotools-cli", "tools/xaero-colorgen", "crates/test-support"]
 
 [workspace.package]
 version = "0.4.0"
 edition = "2021"
+rust-version = "1.89"
 license = "MIT"
 authors = ["XaeroTools contributors"]
 repository = "https://github.com/dekrom/xaerotools"

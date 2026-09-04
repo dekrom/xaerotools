@@ -1,31 +1,13 @@
-//! Parser checks against the real sample corpus (skipped when absent).
-
-use std::path::{Path, PathBuf};
+//! Parser checks against the real sample corpus. `#[ignore]`d, so they report
+//! as skipped rather than as passed when XAERO_CORPUS is unset.
 
 use xaero_core::dimconfig::{parse_dimension_config, parse_minimap_config};
 use xaero_core::waypoints::parse_waypoints_file;
 
-fn corpus_root() -> Option<PathBuf> {
-    let found = if let Ok(p) = std::env::var("XAERO_CORPUS") {
-        let p = PathBuf::from(p);
-        p.is_dir().then_some(p)
-    } else {
-        let fallback = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../sample data");
-        fallback.is_dir().then(|| fallback.canonicalize().unwrap())
-    };
-    if found.is_none() && std::env::var_os("XAERO_REQUIRE_CORPUS").is_some() {
-        panic!(
-            "XAERO_REQUIRE_CORPUS is set but the sample corpus was not found (set XAERO_CORPUS)"
-        );
-    }
-    found
-}
-
 #[test]
+#[ignore = "requires corpus (XAERO_CORPUS)"]
 fn parses_all_sample_waypoint_files() {
-    let Some(root) = corpus_root() else {
-        return;
-    };
+    let root = test_support::corpus_root().expect("XAERO_CORPUS");
     let mut files = 0;
     let mut total = 0;
     for entry in walkdir::WalkDir::new(&root)
@@ -61,10 +43,9 @@ fn parses_all_sample_waypoint_files() {
 }
 
 #[test]
+#[ignore = "requires corpus (XAERO_CORPUS)"]
 fn parses_all_sample_configs() {
-    let Some(root) = corpus_root() else {
-        return;
-    };
+    let root = test_support::corpus_root().expect("XAERO_CORPUS");
     let mut dimcfgs = 0;
     let mut mmcfgs = 0;
     for entry in walkdir::WalkDir::new(&root)

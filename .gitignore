@@ -15,3 +15,6 @@ vault.db
 pyramid.db
 *.db-shm
 *.db-wal
+
+# Coverage output (cargo llvm-cov)
+lcov.info

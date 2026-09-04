@@ -560,21 +560,10 @@ mod tests {
     const T1: u64 = 1_700_000_000_000;
     const T2: u64 = T1 + 86_400_000;
 
-    fn corpus_root() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("XAERO_CORPUS") {
-            let p = PathBuf::from(p);
-            return p.is_dir().then_some(p);
-        }
-        let fallback = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../sample data");
-        fallback.is_dir().then(|| fallback.canonicalize().unwrap())
-    }
-
     #[test]
+    #[ignore = "requires corpus (XAERO_CORPUS)"]
     fn stores_backup_and_merges_shared_from_corpus() {
-        let Some(root) = corpus_root() else {
-            eprintln!("corpus not found; skipping");
-            return;
-        };
+        let root = test_support::corpus_root().expect("XAERO_CORPUS");
         // Two real copies of the same coordinate: major-6 (1.21.4) and
         // major-7 (1.21.8) — a genuine cross-version merge.
         let a = std::fs::read(
@@ -648,10 +637,7 @@ mod tests {
     /// in the merged tree, and the merged file's mtime is the newer of the two.
     #[test]
     fn older_upload_does_not_overwrite_newer_merged_tiles() {
-        let Some(root) = corpus_root() else {
-            eprintln!("corpus not found; skipping");
-            return;
-        };
+        let root = test_support::corpus_root().expect("XAERO_CORPUS");
         // The first same-name pair whose two copies really differ where they
         // overlap — a pair whose merge is the same either way proves nothing.
         let dir_a = root.join("xaero1.21.4/world-map/Multiplayer_2b2t/DIM-1/mw$default");

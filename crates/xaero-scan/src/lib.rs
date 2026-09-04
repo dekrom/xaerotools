@@ -762,18 +762,10 @@ fn scan_minimap_world(
 mod tests {
     use super::*;
 
-    fn corpus_root() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("XAERO_CORPUS") {
-            let p = PathBuf::from(p);
-            return p.is_dir().then_some(p);
-        }
-        let fallback = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../sample data");
-        fallback.is_dir().then(|| fallback.canonicalize().unwrap())
-    }
-
     #[test]
+    #[ignore = "requires corpus (XAERO_CORPUS)"]
     fn discovers_sample_worlds() {
-        let Some(root) = corpus_root() else { return };
+        let root = test_support::corpus_root().expect("XAERO_CORPUS");
         let worlds = discover_root(&root.join("xaero1.21.8"));
         assert!(worlds.iter().any(|w| w.id == "Multiplayer_2b2t"));
         let w2 = worlds.iter().find(|w| w.id == "Multiplayer_2b2t").unwrap();
@@ -802,8 +794,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires corpus (XAERO_CORPUS)"]
     fn discovers_minimap_only_worlds() {
-        let Some(root) = corpus_root() else { return };
+        let root = test_support::corpus_root().expect("XAERO_CORPUS");
         let worlds = discover_root(&root.join("xaero1.21.4"));
         // Worlds the player only ever had the minimap for: waypoints, no map.
         let pvp = worlds
@@ -837,8 +830,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires corpus (XAERO_CORPUS)"]
     fn scans_every_waypoint_file_layout() {
-        let Some(root) = corpus_root() else { return };
+        let root = test_support::corpus_root().expect("XAERO_CORPUS");
         let files = scan_waypoint_files(&root.join("xaero1.21.4"));
         assert!(files.iter().all(|f| f.kind == WaypointSourceKind::Live));
         // Every mw$*_<n>.txt under a dim% folder of the corpus.
@@ -984,8 +978,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires corpus (XAERO_CORPUS)"]
     fn indexes_sample_regions() {
-        let Some(root) = corpus_root() else { return };
+        let root = test_support::corpus_root().expect("XAERO_CORPUS");
         let dir = root.join("xaero1.21.8/world-map/Multiplayer_2b2t/DIM-1/mw$default");
         let idx = index_regions(&dir).unwrap();
         assert_eq!(idx.entries.len(), 794);

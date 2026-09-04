@@ -10,7 +10,22 @@ permissions:
   attestations: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo nextest run --workspace
+      - run: cargo test --workspace --doc
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
