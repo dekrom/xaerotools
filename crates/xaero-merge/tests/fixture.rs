@@ -3,6 +3,8 @@
 //! overlap — null 307 vs 90 regions (20 conflicts), DIM-1 296 vs 794 (71),
 //! DIM1 0 vs 4. Expected merged totals: null 377, DIM-1 1019, DIM1 4.
 
+use std::path::{Path, PathBuf};
+
 use xaero_merge::{merge_to_output, MergeOptions};
 
 fn unit<'a>(
@@ -146,11 +148,9 @@ fn merges_the_2b2t_fixture() {
 /// an uninterrupted run — including rewriting a file the interruption
 /// truncated.
 #[test]
+#[ignore = "requires corpus (XAERO_CORPUS)"]
 fn resume_completes_an_interrupted_merge() {
-    let Some(root) = corpus_root() else {
-        eprintln!("corpus not found; skipping");
-        return;
-    };
+    let root = test_support::corpus_root().expect("XAERO_CORPUS");
     let a = root.join("xaero1.21.4");
     let b = root.join("xaero1.21.8");
     let base = std::env::temp_dir().join(format!("xt-merge-resume-{}", std::process::id()));
@@ -227,11 +227,9 @@ fn resume_completes_an_interrupted_merge() {
 /// the other A world has to survive as a whole copy under its own name, not
 /// be written over the pair's output.
 #[test]
+#[ignore = "requires corpus (XAERO_CORPUS)"]
 fn a_b_world_pairs_at_most_once() {
-    let Some(root) = corpus_root() else {
-        eprintln!("corpus not found; skipping");
-        return;
-    };
+    let root = test_support::corpus_root().expect("XAERO_CORPUS");
     let a = root.join("xaero1.21.8");
     let b = root.join("xaero1.21.4");
     let out = std::env::temp_dir().join(format!("xt-merge-pairing-{}", std::process::id()));
@@ -293,11 +291,9 @@ fn a_b_world_pairs_at_most_once() {
 /// OUT inside A, A inside OUT, or A == B are all refused before anything is
 /// touched, and a non-empty OUT is refused unless resuming.
 #[test]
+#[ignore = "requires corpus (XAERO_CORPUS)"]
 fn refuses_outputs_that_overlap_a_source() {
-    let Some(root) = corpus_root() else {
-        eprintln!("corpus not found; skipping");
-        return;
-    };
+    let root = test_support::corpus_root().expect("XAERO_CORPUS");
     let a = root.join("xaero1.21.4");
     let b = root.join("xaero1.21.8");
     let opts = MergeOptions {

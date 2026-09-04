@@ -636,6 +636,7 @@ mod tests {
     /// months-old sync must not overwrite tiles a fresher upload already put
     /// in the merged tree, and the merged file's mtime is the newer of the two.
     #[test]
+    #[ignore = "requires corpus (XAERO_CORPUS)"]
     fn older_upload_does_not_overwrite_newer_merged_tiles() {
         let root = test_support::corpus_root().expect("XAERO_CORPUS");
         // The first same-name pair whose two copies really differ where they
