@@ -76,7 +76,13 @@ fn parse(buf: &[u8]) -> Option<LegacyBlocks> {
 /// the table and strictly better for rendering.
 pub fn block_name(packed: i32) -> &'static str {
     let id = (packed & 0xFFF) as usize;
-    let meta = ((packed >> 12) & 0xF) as usize;
+    let meta = ((packed >> 12) & 0xFFFFF) as usize;
+    // 1.12 metadata is four bits; a wider value (or a negative word, whose
+    // sign bits land here) names no state the table ever had, and the mod
+    // resolves it to air.
+    if meta > 0xF {
+        return "minecraft:air";
+    }
     let t = table();
     let idx = (id << 4) | meta;
     match t.table.get(idx) {
@@ -223,6 +229,11 @@ mod tests {
         assert_eq!(block_name(35 | (14 << 12)), "minecraft:red_wool");
         // An unrecorded meta resolves via the baked meta-0 fallback.
         assert!(block_name(1 | (13 << 12)).starts_with("minecraft:"));
+        // Metadata wider than four bits (and a negative word) is no state at
+        // all: air, never a neighbouring id's slot.
+        assert_eq!(block_name(35 | (16 << 12)), "minecraft:air");
+        assert_eq!(block_name(35 | (0x10E << 12)), "minecraft:air");
+        assert_eq!(block_name(-1), "minecraft:air");
     }
 
     #[test]

@@ -17,13 +17,22 @@ use rayon::prelude::*;
 use xaero_core::{decode_region, encode_region, read_region_container};
 
 fn corpus_root() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("XAERO_CORPUS") {
+    let found = if let Ok(p) = std::env::var("XAERO_CORPUS") {
         let p = PathBuf::from(p);
-        return p.is_dir().then_some(p);
+        p.is_dir().then_some(p)
+    } else {
+        // repo layout: <XaeroTools>/xaerotools/crates/xaero-core ; corpus at <XaeroTools>/sample data
+        let fallback = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../sample data");
+        fallback.is_dir().then(|| fallback.canonicalize().unwrap())
+    };
+    // A skipped corpus test is a green run that proved nothing. CI (or anyone
+    // who wants the oracle enforced) sets this to turn the skip into a failure.
+    if found.is_none() && std::env::var_os("XAERO_REQUIRE_CORPUS").is_some() {
+        panic!(
+            "XAERO_REQUIRE_CORPUS is set but the sample corpus was not found (set XAERO_CORPUS)"
+        );
     }
-    // repo layout: <XaeroTools>/xaerotools/crates/xaero-core ; corpus at <XaeroTools>/sample data
-    let fallback = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../sample data");
-    fallback.is_dir().then(|| fallback.canonicalize().unwrap())
+    found
 }
 
 fn is_region_file(path: &Path) -> bool {
@@ -172,18 +181,52 @@ fn truncation_never_panics() {
     for rel in picks {
         let path = root.join(rel);
         let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("corpus pick {rel} is missing — skipping it");
             continue;
         };
         let stream = read_region_container(&bytes).unwrap();
+        let full = decode_region(&stream).unwrap();
+        assert!(!full.truncated && full.trailing == 0, "{rel}: full decode");
+        // A cut region has no way to say it was cut: the format has no
+        // terminator, so a cut landing on a chunk boundary decodes as a clean,
+        // shorter region by design. What every cut must satisfy is that
+        // nothing panics and that whatever came back is a prefix of the
+        // whole: the fully-read chunks equal the file's, and the palettes
+        // (first-appearance order) are prefixes of the file's.
+        let check = |cut: usize| {
+            let d = decode_region(&stream[..cut]).unwrap_or_else(|e| {
+                // Only the header can fail; that is the "cut inside the
+                // header" case and the only Err a prefix may produce.
+                assert!(cut < 5, "{rel}: cut {cut}: {e}");
+                full.clone()
+            });
+            let n = d.region.chunks.len();
+            assert!(
+                n <= full.region.chunks.len(),
+                "{rel}: cut {cut} grew chunks"
+            );
+            let complete = n - usize::from(d.truncated && n > 0);
+            assert_eq!(
+                &d.region.chunks[..complete],
+                &full.region.chunks[..complete],
+                "{rel}: cut {cut}: fully-read chunks differ from the file's"
+            );
+            assert!(
+                full.palettes.states.starts_with(&d.palettes.states)
+                    && full.palettes.biomes.starts_with(&d.palettes.biomes),
+                "{rel}: cut {cut}: palettes are not a prefix"
+            );
+            if !d.truncated {
+                assert_eq!(d.trailing, 0, "{rel}: cut {cut}: clean decode left bytes");
+            }
+        };
         for cut in 0..stream.len().min(4000) {
-            let _ = decode_region(&stream[..cut]);
+            check(cut);
         }
         // Also sparse cuts across the whole file.
         let mut cut = 0;
         while cut < stream.len() {
-            if let Ok(d) = decode_region(&stream[..cut]) {
-                assert!(d.truncated || d.trailing > 0 || cut == stream.len());
-            }
+            check(cut);
             cut += 97;
         }
     }

@@ -4,6 +4,7 @@ node_modules/
 
 *.log
 .DS_Store
+__pycache__/
 
 # Ingest credentials and runtime state. docs/INGEST.md tells you to create
 # accounts.txt with one bearer token per line, and the server writes its

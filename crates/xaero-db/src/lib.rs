@@ -358,6 +358,27 @@ pub(crate) fn open_conn_readonly(path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
+/// XaeroPlus's `V1ToV2Migration` rebuilds each table through a
+/// `<table>_v2_migration` twin and drops the twin at the end; an interrupted
+/// game run leaves it behind. The mod skips such names when it enumerates and
+/// drops them before retrying, and so do we — they are never a dimension.
+pub(crate) fn is_migration_leftover(name: &str) -> bool {
+    name.ends_with("_v2_migration")
+}
+
+/// SQLite URI for `ATTACH`, so `mode=ro` can be passed. The URI parser decodes
+/// `%XX` and stops at `#`/`?`, so those have to be escaped in the path itself
+/// (`%` first, or the escapes themselves would be re-decoded).
+pub(crate) fn attach_uri(path: &std::path::Path) -> String {
+    let p = path
+        .display()
+        .to_string()
+        .replace('%', "%25")
+        .replace('#', "%23")
+        .replace('?', "%3F");
+    format!("file:{p}?mode=ro")
+}
+
 pub(crate) fn inspect(conn: &Connection) -> Result<(u32, MetadataShape, Vec<String>), String> {
     let mut tables = Vec::new();
     let mut has_metadata = false;
@@ -373,7 +394,7 @@ pub(crate) fn inspect(conn: &Connection) -> Result<(u32, MetadataShape, Vec<Stri
         for name in names.flatten() {
             if name == "metadata" {
                 has_metadata = true;
-            } else {
+            } else if !is_migration_leftover(&name) {
                 tables.push(name);
             }
         }

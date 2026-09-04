@@ -122,6 +122,13 @@ fn restrict_permissions(path: &Path) {
 fn restrict_permissions(_path: &Path) {}
 
 /// File mtime in unix ms (0 when missing) — used to hot-reload tokens.
+/// Change stamp for the config file: mtime plus length, so an edit that lands
+/// within one mtime tick (coarse filesystems round to 1-2 s) is still seen.
+pub fn file_stamp(path: &Path) -> (u64, u64) {
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    (mtime_ms(path), len)
+}
+
 pub fn mtime_ms(path: &Path) -> u64 {
     std::fs::metadata(path)
         .ok()
@@ -170,7 +177,7 @@ impl FileConfig {
     }
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = a.len() ^ b.len();
     for i in 0..a.len().max(b.len()) {
         let x = a.get(i).copied().unwrap_or(0);

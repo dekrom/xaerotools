@@ -209,9 +209,41 @@ add `--apply` (**Apply** in the Tools tab):
 - XaeroPlus databases merge too, keeping your oldest "first seen" history.
 - Your source folders are **never modified**, and the output must be an
   empty folder.
+- If a merge is interrupted, `--resume` continues it into the same output
+  instead of starting over: finished regions are left alone, and a file the
+  interruption truncated is written again rather than kept.
 
 `.\xaerotools db-merge A.db B.db -o Merged.db --apply` merges databases on
 their own.
+
+## Filling the gaps from a world download
+
+Public 2b2t world downloads cover ground you never walked. `import-zvcr`
+converts one into ordinary Xaero map data, which you then merge underneath your
+own — your map wins wherever you actually went, the download fills the rest.
+
+```
+.\xaerotools import-zvcr --src "D:\wdl\nether" -o "D:\from-download"
+.\xaerotools merge "D:\from-download" "C:\...\xaero" -o "D:\merged" --apply
+```
+
+It reads the [zvcr3d](https://github.com/2b2tplace/zvcr) format the 1M release
+ships in, and reproduces the game's own column algorithm rather than inventing
+a look of its own — including XaeroPlus's Nether roof removal, so a converted
+Nether looks like the one you fly over, not a sheet of bedrock. On a region
+that both sources cover, the converted pixels match what the game itself wrote
+for 100% of block choices and 99.99% of heights; what differs is what actually
+changed on the server between the two captures.
+
+Each converted region is stamped with the date the download actually observed
+it, not with today, so the merge's usual "newest wins" weighs the two sources
+honestly — your captures win where they are more recent, the download wins
+where it is. If you would rather your own map win everywhere it has data,
+pass `--prefer b` (with your archive as the second path).
+
+The download ships as SquashFS ring images; `scripts/import-1m-wdl.sh` walks
+them one at a time so you never need to extract all of it at once, and can be
+rerun to pick up where it stopped.
 
 ## Playing together
 

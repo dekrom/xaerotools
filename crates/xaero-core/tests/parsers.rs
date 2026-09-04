@@ -6,12 +6,19 @@ use xaero_core::dimconfig::{parse_dimension_config, parse_minimap_config};
 use xaero_core::waypoints::parse_waypoints_file;
 
 fn corpus_root() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("XAERO_CORPUS") {
+    let found = if let Ok(p) = std::env::var("XAERO_CORPUS") {
         let p = PathBuf::from(p);
-        return p.is_dir().then_some(p);
+        p.is_dir().then_some(p)
+    } else {
+        let fallback = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../sample data");
+        fallback.is_dir().then(|| fallback.canonicalize().unwrap())
+    };
+    if found.is_none() && std::env::var_os("XAERO_REQUIRE_CORPUS").is_some() {
+        panic!(
+            "XAERO_REQUIRE_CORPUS is set but the sample corpus was not found (set XAERO_CORPUS)"
+        );
     }
-    let fallback = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../sample data");
-    fallback.is_dir().then(|| fallback.canonicalize().unwrap())
+    found
 }
 
 #[test]

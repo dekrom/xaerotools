@@ -353,10 +353,7 @@ pub fn merge_into(
 
     for (i, source) in sources.iter().enumerate() {
         let alias = format!("src{i}");
-        let uri = format!(
-            "file:{}?mode=ro",
-            source.display().to_string().replace('?', "%3F")
-        );
+        let uri = crate::attach_uri(source);
         conn.execute(&format!("ATTACH DATABASE ?1 AS {alias}"), [&uri])
             .map_err(|er| format!("attach {}: {er}", source.display()))?;
         let result = merge_one(&conn, &alias, apply, &mut report.tables);

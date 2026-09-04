@@ -116,7 +116,7 @@ def main():
         print("warning: --account exposes tokens via /proc; prefer --accounts-file", file=sys.stderr)
     if args.accounts_file:
         with open(args.accounts_file) as f:
-            specs += [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+            specs += [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
     if not specs:
         ap.error("need --accounts-file PATH or at least one --account NAME=TOKEN")
     cx, cz = (float(v) for v in args.center.split(","))

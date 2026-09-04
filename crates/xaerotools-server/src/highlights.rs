@@ -261,23 +261,25 @@ pub(crate) async fn ingest_highlights(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let declared = headers.get("x-xt-player").and_then(|v| v.to_str().ok());
+    let auth = match crate::live::ingest_player(&st, &headers, peer, declared).await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     // The whole point of the channel is a server that is *not* this instance's
     // machine. Locally the server already reads the live databases through a
-    // scanned root, so accepting a copy would fork the same data in two.
-    // `to_canonical` so an IPv4-mapped IPv6 peer (`::ffff:127.0.0.1`) reads as
-    // loopback here too — the same normalisation the token path uses.
-    if peer.ip().to_canonical().is_loopback() {
+    // scanned root, so accepting a copy would fork the same data in two. "Local"
+    // is the tokenless loopback exemption, not the peer address: a client that
+    // authenticated with a token is a remote one even when a reverse proxy on
+    // this box makes it look like a loopback peer.
+    if auth.local {
         return (
             StatusCode::FORBIDDEN,
             "highlight sync is for remote servers — this one already reads your local databases",
         )
             .into_response();
     }
-    let declared = headers.get("x-xt-player").and_then(|v| v.to_str().ok());
-    let player = match crate::live::ingest_player(&st, &headers, peer, declared).await {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
+    let player = auth.player;
     if let Err(msg) = validate(&q) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
@@ -289,7 +291,7 @@ pub(crate) async fn ingest_highlights(
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
     {
-        let mut rate = st.ingest.hl_rate.lock().unwrap();
+        let mut rate = crate::lock_ok(&st.ingest.hl_rate);
         let bucket = rate
             .entry(player.clone())
             .or_insert_with(|| Bucket::new(RATE_BURST, now_ms()));
@@ -310,7 +312,10 @@ pub(crate) async fn ingest_highlights(
     .await;
     let (stored, q) = match stored {
         Ok(v) => v,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "store task failed").into_response(),
+        Err(e) => {
+            eprintln!("highlights: store task failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "store task failed").into_response();
+        }
     };
     let (changed, made_table) = match stored {
         Ok(v) => v,
@@ -327,7 +332,7 @@ pub(crate) async fn ingest_highlights(
         // upload's rescan can publish the new database between its creation
         // and this table's commit, and a tile served in that window leaves
         // behind exactly such a stale handle.
-        st.dbs.lock().unwrap().retain(|(_, name), _| name != &q.db);
+        crate::lock_ok(&st.dbs).retain(|(_, name), _| name != &q.db);
     }
 
     // A database the world did not have is a new overlay: the world list has
@@ -338,11 +343,7 @@ pub(crate) async fn ingest_highlights(
     // shape as the region path's `layer_known`.
     let mut rescanned = false;
     if !existed {
-        let _gate = st.ingest.rescan_gate.lock().await;
-        if !db_known(&st, &q) {
-            crate::rescan_roots(&st).await;
-            rescanned = true;
-        }
+        rescanned = crate::ingest::rescan_for_upload(&st, || !db_known(&st, &q)).await;
     }
     if !rescanned && changed > 0 {
         // Our own write, announced directly rather than waiting on inotify —

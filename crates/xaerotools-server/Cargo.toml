@@ -20,4 +20,5 @@ rayon = "1"
 xaero-merge = { path = "../xaero-merge" }
 xaero-db = { path = "../xaero-db" }
 getrandom = "0.4.3"
+filetime = "0.2"
 rusqlite = { version = "0.37", features = ["bundled"] }

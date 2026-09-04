@@ -301,7 +301,9 @@ pub fn sample_regions(index: &RegionIndex, n: usize) -> Vec<PathBuf> {
             .filter_map(|&(rx, rz)| index.region_path(rx, rz))
             .collect();
     }
-    let step = (keys.len() / n).max(1);
+    // Rounded up: a floored step with `take(n)` never reaches the tail of the
+    // sorted keys (511 regions sampled at 256 would all come from one half).
+    let step = keys.len().div_ceil(n).max(1);
     keys.iter()
         .step_by(step)
         .take(n)

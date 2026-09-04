@@ -153,3 +153,198 @@ fn merges_the_2b2t_fixture() {
 
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// An interrupted merge must be continuable: `--resume` fills in what is
+/// missing, leaves finished output alone, and still reaches the same result as
+/// an uninterrupted run — including rewriting a file the interruption
+/// truncated.
+#[test]
+fn resume_completes_an_interrupted_merge() {
+    let Some(root) = corpus_root() else {
+        eprintln!("corpus not found; skipping");
+        return;
+    };
+    let a = root.join("xaero1.21.4");
+    let b = root.join("xaero1.21.8");
+    let base = std::env::temp_dir().join(format!("xt-merge-resume-{}", std::process::id()));
+    let full = base.join("full");
+    let partial = base.join("partial");
+    let _ = std::fs::remove_dir_all(&base);
+
+    let opts = MergeOptions {
+        apply: true,
+        servers: vec!["Multiplayer_2b2t".into()],
+        ..Default::default()
+    };
+
+    // Reference: one clean, uninterrupted merge.
+    merge_to_output(&a, &b, &full, &opts).unwrap();
+
+    // Now simulate the interrupted run: same merge, then damage the output the
+    // way a hard stop would — delete some regions outright and truncate one.
+    merge_to_output(&a, &b, &partial, &opts).unwrap();
+    let layer = partial.join("world-map/Multiplayer_2b2t/DIM-1/mw$default");
+    let mut regions: Vec<PathBuf> = std::fs::read_dir(&layer)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "zip"))
+        .collect();
+    regions.sort();
+    assert!(regions.len() > 20, "fixture should have regions to damage");
+    let deleted: Vec<PathBuf> = regions.iter().take(10).cloned().collect();
+    for p in &deleted {
+        std::fs::remove_file(p).unwrap();
+    }
+    let truncated = regions[11].clone();
+    std::fs::write(&truncated, b"half a file").unwrap();
+
+    // Without --resume the guard refuses to touch a non-empty output at all.
+    // With it, the run fills the holes back in.
+    let resumed = MergeOptions {
+        resume: true,
+        ..opts.clone()
+    };
+    merge_to_output(&a, &b, &partial, &resumed).unwrap();
+
+    for p in &deleted {
+        assert!(p.exists(), "resume should have restored {}", p.display());
+    }
+    let reference = full.join("world-map/Multiplayer_2b2t/DIM-1/mw$default");
+    let rebuilt = std::fs::read(&truncated).unwrap();
+    let expected = std::fs::read(reference.join(truncated.file_name().unwrap())).unwrap();
+    assert_eq!(
+        rebuilt, expected,
+        "a truncated copy must be written again, not kept"
+    );
+
+    // Every file of the clean run is present in the resumed one, byte for byte.
+    for entry in std::fs::read_dir(&reference).unwrap() {
+        let want = entry.unwrap().path();
+        let got = layer.join(want.file_name().unwrap());
+        assert!(got.exists(), "missing after resume: {}", got.display());
+        assert_eq!(
+            std::fs::read(&got).unwrap(),
+            std::fs::read(&want).unwrap(),
+            "differs after resume: {}",
+            got.display()
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// One B world must pair with at most one A world. The corpus has the case
+/// built in: the 1.21.8 root holds both `Multiplayer_2b2t` and
+/// `Multiplayer_2b2t.org`, and both match the 1.21.4 root's `Multiplayer_2b2t`
+/// once the base-domain heuristic is accepted. The exact match wins the pair;
+/// the other A world has to survive as a whole copy under its own name, not
+/// be written over the pair's output.
+#[test]
+fn a_b_world_pairs_at_most_once() {
+    let Some(root) = corpus_root() else {
+        eprintln!("corpus not found; skipping");
+        return;
+    };
+    let a = root.join("xaero1.21.8");
+    let b = root.join("xaero1.21.4");
+    let out = std::env::temp_dir().join(format!("xt-merge-pairing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+
+    let opts = MergeOptions {
+        apply: true,
+        auto_alias: true,
+        ..Default::default()
+    };
+    let report = merge_to_output(&a, &b, &out, &opts).unwrap();
+    assert_eq!(
+        report.world_pairs,
+        vec![(
+            "Multiplayer_2b2t".to_string(),
+            "Multiplayer_2b2t".to_string()
+        )]
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("Multiplayer_2b2t.org (A)")),
+        "the second claim on the B world must be reported: {:?}",
+        report.warnings
+    );
+
+    let zips = |dir: &Path| -> usize {
+        std::fs::read_dir(dir)
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".zip"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    // The pair merged as in the fixture test (roles swapped, same totals).
+    let paired = out.join("world-map/Multiplayer_2b2t");
+    assert_eq!(zips(&paired.join("null/mw$default")), 377);
+    assert_eq!(zips(&paired.join("DIM-1/mw$default")), 1019);
+    // The .org world arrived whole under its own name, every layer intact.
+    let src = a.join("world-map/Multiplayer_2b2t.org");
+    let dst = out.join("world-map/Multiplayer_2b2t.org");
+    let mut layers = 0;
+    for dim in ["null", "DIM-1", "DIM1"] {
+        let layer = Path::new(dim).join("mw$default");
+        let want = zips(&src.join(&layer));
+        if want > 0 {
+            layers += 1;
+            assert_eq!(zips(&dst.join(&layer)), want, "{dim} regions lost");
+        }
+    }
+    assert!(layers > 0, "fixture should carry .org regions");
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// The guard against writing into a source is the library's, not the CLI's:
+/// OUT inside A, A inside OUT, or A == B are all refused before anything is
+/// touched, and a non-empty OUT is refused unless resuming.
+#[test]
+fn refuses_outputs_that_overlap_a_source() {
+    let Some(root) = corpus_root() else {
+        eprintln!("corpus not found; skipping");
+        return;
+    };
+    let a = root.join("xaero1.21.4");
+    let b = root.join("xaero1.21.8");
+    let opts = MergeOptions {
+        apply: true,
+        ..Default::default()
+    };
+    let probe = a.join("world-map/Multiplayer_2b2t/server_config.txt");
+    let before = std::fs::read(&probe).ok();
+
+    let inside = a.join("merged-here");
+    let err = merge_to_output(&a, &b, &inside, &opts).unwrap_err();
+    assert!(err.contains("overlaps A root"), "{err}");
+    assert!(!inside.exists());
+
+    let err = merge_to_output(&a, &b, &a, &opts).unwrap_err();
+    assert!(err.contains("overlaps A root"), "{err}");
+    let err = merge_to_output(&a, &a, &std::env::temp_dir().join("xt-never"), &opts).unwrap_err();
+    assert!(err.contains("same directory"), "{err}");
+
+    let around = root.clone();
+    let err = merge_to_output(&a, &b, &around, &opts).unwrap_err();
+    assert!(err.contains("overlaps"), "{err}");
+
+    let busy = std::env::temp_dir().join(format!("xt-merge-busy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&busy);
+    std::fs::create_dir_all(&busy).unwrap();
+    std::fs::write(busy.join("something"), b"x").unwrap();
+    let err = merge_to_output(&a, &b, &busy, &opts).unwrap_err();
+    assert!(err.contains("not empty"), "{err}");
+    let _ = std::fs::remove_dir_all(&busy);
+
+    assert_eq!(
+        std::fs::read(&probe).ok(),
+        before,
+        "a refused run must not touch A"
+    );
+}

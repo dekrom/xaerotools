@@ -43,6 +43,13 @@ const RATE_PER_SEC: f64 = 4.0;
 const RATE_BURST: f64 = 8.0;
 /// |cx|/|cz| cap: the world border in chunks, with slack.
 const CHUNK_COORD_CAP: i32 = 2_600_000;
+/// Distinct dimension canvases held at once. A dimension is any well-formed
+/// `namespace:path`, so without a cap one client could allocate canvases until
+/// memory ran out; sixteen covers the vanilla three plus any modded server.
+const MAX_DIMS: usize = 16;
+/// Evicted chunks leave their key in `order`; past this many ghosts it is
+/// rebuilt from the live set instead of growing for the rest of the session.
+const GHOST_SLACK: usize = 65_536;
 
 /// One chunk's preview: 16x16 RGB565 plus its average color for far zooms.
 struct ChunkPix {
@@ -57,6 +64,19 @@ struct DimCanvas {
     order: VecDeque<(i32, i32)>,
     /// Bumped on every mutation; the preview tiles' cache validator.
     gen: u64,
+}
+
+impl DimCanvas {
+    /// A canvas whose generation can never repeat one from an earlier run:
+    /// browsers revalidate preview tiles by ETag and keep them across server
+    /// restarts, so a counter that restarted at zero would let a stale tile
+    /// from the last session answer a fresh request with 304.
+    fn fresh() -> DimCanvas {
+        DimCanvas {
+            gen: now_ms() << 16,
+            ..Default::default()
+        }
+    }
 }
 
 pub(crate) struct PreviewState {
@@ -74,9 +94,7 @@ impl PreviewState {
 
     /// Total chunks held across dimensions (diagnostics).
     pub(crate) fn chunk_count(&self) -> usize {
-        self.dims
-            .lock()
-            .unwrap()
+        crate::lock_ok(&self.dims)
             .values()
             .map(|c| c.chunks.len())
             .sum()
@@ -85,7 +103,7 @@ impl PreviewState {
     /// Drops every preview chunk covered by region (rx, rz) of `dim_key` —
     /// called when the authoritative region file lands via ingest.
     pub(crate) fn evict_region(&self, dim_key: &str, rx: i32, rz: i32) -> bool {
-        let mut dims = self.dims.lock().unwrap();
+        let mut dims = crate::lock_ok(&self.dims);
         let Some(canvas) = dims.get_mut(dim_key) else {
             return false;
         };
@@ -97,6 +115,13 @@ impl PreviewState {
         }
         if removed {
             canvas.gen += 1;
+            // The keys just removed stay in `order` (a re-previewed chunk is
+            // pushed again); prune them once they outnumber the slack rather
+            // than on every eviction.
+            if canvas.order.len() > canvas.chunks.len() + GHOST_SLACK {
+                let DimCanvas { chunks, order, .. } = &mut *canvas;
+                order.retain(|k| chunks.contains_key(k));
+            }
         }
         removed
     }
@@ -160,14 +185,14 @@ pub(crate) async fn ingest_preview(
 ) -> Response {
     let declared = headers.get("x-xt-player").and_then(|v| v.to_str().ok());
     let player = match crate::live::ingest_player(&st, &headers, peer, declared).await {
-        Ok(p) => p,
+        Ok(a) => a.player,
         Err(resp) => return resp,
     };
     let Some(dim) = normalize_dim(&q.dim) else {
         return (StatusCode::BAD_REQUEST, "unrecognized dim").into_response();
     };
     {
-        let mut rate = st.preview.rate.lock().unwrap();
+        let mut rate = crate::lock_ok(&st.preview.rate);
         let bucket = rate
             .entry(player)
             .or_insert_with(|| Bucket::new(RATE_BURST, now_ms()));
@@ -182,8 +207,15 @@ pub(crate) async fn ingest_preview(
 
     let mut regions: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
     {
-        let mut dims = st.preview.dims.lock().unwrap();
-        let canvas = dims.entry(dim.clone()).or_default();
+        let mut dims = crate::lock_ok(&st.preview.dims);
+        if !dims.contains_key(&dim) && dims.len() >= MAX_DIMS {
+            return (
+                StatusCode::BAD_REQUEST,
+                "too many preview dimensions on this server",
+            )
+                .into_response();
+        }
+        let canvas = dims.entry(dim.clone()).or_insert_with(DimCanvas::fresh);
         for (cx, cz, pix) in entries {
             regions.insert((cx.div_euclid(32), cz.div_euclid(32)));
             // Average of the *visible* pixels only — value 0 means "nothing
@@ -241,11 +273,7 @@ pub(crate) async fn preview_tile(
     }
     // The canvas generation is the content identity: any chunk landing or
     // being evicted bumps it. A matching If-None-Match costs no render.
-    let gen = st
-        .preview
-        .dims
-        .lock()
-        .unwrap()
+    let gen = crate::lock_ok(&st.preview.dims)
         .get(&dim)
         .map(|c| c.gen)
         .unwrap_or(0);
@@ -277,7 +305,7 @@ pub(crate) async fn preview_tile(
 }
 
 fn render_preview_tile(st: &AppState, dim: &str, z: i32, x: i32, y: i32) -> Option<Vec<u8>> {
-    let dims = st.preview.dims.lock().unwrap();
+    let dims = crate::lock_ok(&st.preview.dims);
     let canvas = dims.get(dim)?;
     if canvas.chunks.is_empty() {
         return None;

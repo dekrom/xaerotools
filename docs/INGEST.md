@@ -19,16 +19,22 @@ and a restart starts with an empty roster.
 
 ## Getting a token
 
-**A client on the server's own machine needs no token.** Connections from
-loopback (`127.0.0.1` / `::1`) may omit the `Authorization` header entirely
-and just declare their player name — positions already carry it in the body,
-and region uploads send it in an `X-XT-Player` header. Tokens gate *remote*
-connections; a local process could read the config file the tokens live in
-anyway, so demanding one of it adds setup without adding security. Two edges
-to know: a token that *is* presented is always validated, even from loopback
-(a revoked or mistyped token fails 401 instead of silently falling back), and
-browser pages get no exemption (cross-origin requests are rejected, and both
-routes need content types no hostile page can send without a CORS preflight).
+**A client on the server's own machine needs no token** — while the server
+itself listens on loopback. Connections from loopback (`127.0.0.1` / `::1`)
+may then omit the `Authorization` header entirely and just declare their
+player name — positions already carry it in the body, and region uploads send
+it in an `X-XT-Player` header. Tokens gate *remote* connections; a local
+process could read the config file the tokens live in anyway, so demanding one
+of it adds setup without adding security. Three edges to know: a token that
+*is* presented is always validated, even from loopback (a revoked or mistyped
+token fails 401 instead of silently falling back); browser pages get no
+exemption (cross-origin requests are rejected, and both routes need content
+types no hostile page can send without a CORS preflight); and the exemption
+does not exist under `--lan`, nor with `--ingest-require-token`. The peer
+address only means "this machine" when nothing sits in front of the server:
+a reverse proxy on the same box makes *every* client a loopback peer, so a
+proxied server must run with `--ingest-require-token` (or `--lan`), and its
+local clients then use tokens like everyone else.
 
 Remote clients authenticate with per-player bearer tokens, generated on the
 server box:
@@ -121,7 +127,7 @@ Rejected with 400 unless all of: `x`, `y`, `z`, `yaw` finite (no NaN/Inf),
 | status | meaning |
 |--------|---------|
 | 204 No Content | accepted; broadcast to all `/ws/live` viewers |
-| 401 | no token from a **remote** peer (`missing bearer token`), or a presented token not in the config (`unknown token`) — tokenless loopback requests pass |
+| 401 | no token from a **remote** peer (`missing bearer token`), or a presented token not in the config (`unknown token`) — tokenless loopback requests pass only while the exemption applies (see above) |
 | 403 | valid token, but body `player` doesn't match the token's player; or a tokenless request with a cross-origin `Origin` header |
 | 400 | `unrecognized dim`, `coordinates out of range`, or a tokenless `player` name that fails the safe-character rule |
 | 429 | per-player rate limit exceeded — slow down and keep going |
@@ -135,8 +141,9 @@ Malformed requests are rejected by the framework before auth runs: missing or
 wrong `Content-Type` → 415, invalid JSON syntax → 400, valid JSON with a
 missing field or wrong type → 422.
 
-Anything under `/ingest` other than a POST to one of the four exact routes in
-this document (`position`, `region`, `preview`, `highlights`) is 404.
+Anything under `/ingest` other than the four exact routes in this document
+(`position`, `region`, `preview`, `highlights`) is 404; a non-POST to one of
+them is 405 (404 under `--lan`, where unknown requests are not distinguished).
 
 ### Rate limit
 
@@ -153,9 +160,12 @@ denied request consumes nothing — the bucket refills continuously. **Post at
   cannot view the map — it only authorizes posting that one player's position.
 - **Loopback is trusted, the network is not.** The tokenless exemption keys
   off the TCP peer address (never a header, which anything can forge): only
-  `127.0.0.1`/`::1` qualifies, so under `--lan` every other machine still
-  needs a token. Cross-origin browser requests are rejected even from
-  loopback, so a hostile web page can't ride the exemption.
+  `127.0.0.1`/`::1` qualifies, and only while the server listens on loopback
+  itself — under `--lan` there is no exemption, every client needs a token.
+  Behind a reverse proxy every peer *is* loopback, which is why a proxied
+  server must run with `--ingest-require-token`. Cross-origin browser
+  requests are rejected even from loopback, so a hostile web page can't ride
+  the exemption.
 - **Plain HTTP.** There is no in-process TLS; the token crosses the wire in
   cleartext. Default bind is `127.0.0.1`. `--lan` (which requires
   `--password`, protecting the *viewer*) binds `0.0.0.0`. Per ADR 007, beyond
@@ -179,6 +189,10 @@ that falls behind the broadcast channel is not dropped: the server skips the
 missed events and sends a `resync` frame instead — refresh your tile layers
 in place when you see one.
 
+`hb` — a heartbeat every 25 s while nothing else is being sent; carries no
+data (`{"type":"hb"}`), so a client that has heard nothing for a minute knows
+the socket is dead and reconnects.
+
 `hello` — sent once on connect, the current roster (each entry is a full
 `pos` object):
 
@@ -192,6 +206,14 @@ in place when you see one.
 ```json
 {"type":"pos","player":"Account1","dim":"minecraft:overworld",
  "x":124.1,"y":64.0,"z":-419.9,"yaw":175.5,"t":1750000001000}
+```
+
+`player_removed` — a player was dropped from the roster (`DELETE
+/api/players`, local-only); remove the marker. The player returns on their
+next position report:
+
+```json
+{"type":"player_removed","player":"Account1","v":43}
 ```
 
 `tiles` — map tiles changed on disk; `w`/`d`/`m` are positional indexes into
@@ -246,10 +268,12 @@ that does not fully decode, then stores it twice under its ingest dir
 
 - `players/<player>/world-map/<world>/…` — the uploaded bytes **verbatim**: a
   per-client backup of exactly what that account's game has mapped.
-- `merged/world-map/<world>/…` — tile-merged across every uploader: tiles the
-  upload carries win (they are the newest observation), tiles it lacks
-  survive from what was already merged. Re-encoded as 7.8, self-checked by
-  decoding before the atomic rename.
+- `merged/world-map/<world>/…` — tile-merged across every uploader: where
+  both sides have a tile, the **newer observation** wins — the upload's
+  `X-XT-Mtime` against the merged file's own mtime — so a client syncing a
+  months-old map never overwrites fresher tiles; tiles only one side has
+  survive. The merged file carries the newer of the two times. Re-encoded as
+  7.8, self-checked by decoding before the atomic rename.
 
 Both trees are ordinary Xaero layouts and are served automatically as roots
 (origin `ingest` in `/api/roots`) — no restart, no manual root adding. The
@@ -264,12 +288,20 @@ scanned roots stay read-only.
 POST /ingest/v1/region?world=Multiplayer_2b2t&dim=null&mw=mw$default&rx=12&rz=-34
 Authorization: Bearer <token>        (remote; loopback may send X-XT-Player: <player> instead)
 Content-Type: application/octet-stream
+X-XT-Mtime: 1750000000000            (optional: the region file's mtime, unix ms)
 ```
 
 A tokenless loopback upload identifies its player with the `X-XT-Player`
 header (same safe-character rule as `world`). When a valid token is presented
 the header is ignored — the token names the player. Tokenless with neither is
 401.
+
+`X-XT-Mtime` is when the client's game last wrote the file — send the file's
+mtime. It becomes the backup copy's mtime and decides which side's tiles win
+in the merged tree (above). Absent or unparsable means "now"; a value in the
+future is clamped to the server's clock, so a wrong client clock cannot make
+its tiles beat every later upload. A full-map sync of an old archive without
+it would stamp every region as observed today.
 
 Query parameters (all path segments exactly as they are named on the client's
 disk):
@@ -302,8 +334,8 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
 |--------|---------|
 | 204 No Content | validated, backed up, merged |
 | 401 / 403 | as for position (same tokens, same backoff); 403 also covers a token whose player name is not filesystem-safe, and any `cave=N` upload when the server runs `--ingest-no-caves` — drop the region, do not retry |
-| 400 | bad `world`/`dim`/`mw` name, coordinates out of range, or a body that does not decode as a region — **including a truncated one**: the client caught the game mid-write and should retry after the file settles |
-| 413 | body over 32 MiB |
+| 400 | bad `world`/`dim`/`mw` name, coordinates out of range, an empty body, or a body that does not decode as a region — **including a truncated one**: the client caught the game mid-write and should retry after the file settles |
+| 413 | body over 32 MiB (auth and the rate limit run before the body is read, so a rejected request never buffers it) |
 | 429 | rate limited — slow down and keep going |
 
 ### Rate limit and client behaviour
@@ -413,9 +445,10 @@ a client streams what it has found since its last accepted batch instead.
 
 **Remote servers only.** A server on the same machine as the game already
 reads those databases through a scanned root, and a second copy of the same
-data would diverge from the first. Uploads from a loopback peer are refused
-with 403, and a client should not offer the feature when its server URL is
-local.
+data would diverge from the first. Uploads that came in through the tokenless
+loopback exemption are refused with 403 (a token-authenticated client is a
+remote one, even when a proxy makes it look like a loopback peer), and a
+client should not offer the feature when its server URL is local.
 
 ### Request
 
@@ -454,8 +487,9 @@ then count × {
 ### Responses
 
 204 accepted; 400 for a malformed batch, an unsyncable `db`, a bad `dim` key
-or out-of-range chunk coordinates; 403 when the peer is loopback (see above);
-401 when the token is missing or unknown, as for position ingest; 429 over the
+or out-of-range chunk coordinates; 403 when the request used the loopback
+exemption (see above); 401 when the token is missing or unknown, as for
+position ingest; 413 for a body over the 4096-row batch size; 429 over the
 rate limit (**4 batches/s sustained, burst 12** per player — a batch holds 4096
 rows). The burst clears a full sweep of all nine databases, so a client may
 send them back to back.

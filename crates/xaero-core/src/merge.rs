@@ -137,7 +137,7 @@ mod tests {
             Pixel {
                 params,
                 state: Some(st),
-                height: 0,
+                height,
                 legacy_height: None,
                 top_height: None,
                 overlays: smallvec![],

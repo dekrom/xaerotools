@@ -99,6 +99,10 @@ pub struct ServerConfig {
     /// Refuse cave-layer region uploads (`cave=N`) with 403 — the ingest
     /// trees then only ever hold surface data, whatever clients send.
     pub ingest_no_caves: bool,
+    /// Require a bearer token from every ingest client, loopback included.
+    /// The tokenless loopback exemption keys off the TCP peer address, which a
+    /// reverse proxy on the same machine turns into "everyone".
+    pub ingest_require_token: bool,
     /// Force the poll fallback instead of inotify watches.
     pub live_poll: bool,
 }
@@ -120,6 +124,7 @@ impl Default for ServerConfig {
             config_path: None,
             ingest_dir: None,
             ingest_no_caves: false,
+            ingest_require_token: false,
             live_poll: false,
         }
     }
@@ -290,6 +295,11 @@ pub struct AppState {
     ingest_dir: PathBuf,
     /// Refuse `cave=N` region uploads (see ServerConfig::ingest_no_caves).
     ingest_no_caves: bool,
+    /// Whether a tokenless loopback peer may ingest as a self-declared player.
+    /// Only while the server itself listens on loopback — under `--lan`, or
+    /// behind a reverse proxy that makes every client a loopback peer, the
+    /// address proves nothing — and not under `--ingest-require-token`.
+    loopback_exempt: bool,
     /// Roots from --root flags: session-only, never persisted.
     cli_roots: Vec<PathBuf>,
     config_path: PathBuf,
@@ -328,7 +338,8 @@ pub(crate) fn build_buckets(index: &RegionIndex) -> RegionBuckets {
 
 struct ConfigCache {
     file: config::FileConfig,
-    mtime: u64,
+    /// (mtime, length) of the file the cache was loaded from.
+    stamp: (u64, u64),
     last_stat: std::time::Instant,
 }
 
@@ -417,6 +428,9 @@ async fn api_tools_merge(
             Some("b") => xaero_merge::Prefer::B,
             _ => xaero_merge::Prefer::Mtime,
         },
+        // Resuming is a terminal recovery step for an interrupted run; the
+        // Tools tab still requires a fresh, empty output directory.
+        resume: false,
         servers: Vec::new(),
         aliases: req.aliases,
         auto_alias: req.auto_alias,
@@ -477,8 +491,15 @@ async fn api_tools_dbmerge(
             base.clone()
         };
         let source_refs: Vec<&Path> = sources.iter().map(|p| p.as_path()).collect();
-        let report = xaero_db::merge::merge_into(&dest, &source_refs, apply)?;
-        serde_json::to_value(&report).map_err(|e| e.to_string())
+        // A Drawing DB has its own schema and merger; the highlight merger's
+        // v2 normalization fails on it and leaves `out` a plain copy of base.
+        let name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let value = if xaero_db::drawing::is_drawing_db(name) {
+            serde_json::to_value(xaero_db::drawing::merge_into(&dest, &source_refs, apply)?)
+        } else {
+            serde_json::to_value(xaero_db::merge::merge_into(&dest, &source_refs, apply)?)
+        };
+        value.map_err(|e| e.to_string())
     });
     axum::Json(serde_json::json!({ "job": id })).into_response()
 }
@@ -730,7 +751,10 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
         },
         dbs: Mutex::new(HashMap::new()),
         vault,
-        generation: AtomicU64::new(1),
+        // Seeded per run: browsers keep tiles across server restarts and
+        // revalidate them by ETag, which carries this stamp. A counter that
+        // restarted at 1 would hand a stale tile from the last session a 304.
+        generation: AtomicU64::new(now_ms() << 16),
         epoch: AtomicU64::new(1),
         atlas_dir,
         atlas_sets,
@@ -742,10 +766,13 @@ pub async fn run(config: ServerConfig) -> Result<(), String> {
         preview: preview::PreviewState::new(),
         ingest_dir,
         ingest_no_caves: config.ingest_no_caves,
+        loopback_exempt: config.bind.ip().is_loopback()
+            && config.password.is_none()
+            && !config.ingest_require_token,
         cli_roots,
         config: Mutex::new(ConfigCache {
             file: file_config,
-            mtime: config::mtime_ms(&config_path),
+            stamp: config::file_stamp(&config_path),
             last_stat: std::time::Instant::now(),
         }),
         config_path,
@@ -1027,6 +1054,15 @@ async fn api_roots_add(
         )
             .into_response();
     }
+    // The same rule startup enforces: persisting an overlapping root here
+    // would make the next `serve` refuse to start.
+    if st.ingest_dir.starts_with(&p) || p.starts_with(&st.ingest_dir) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "refusing a root that overlaps the ingest dir (the server would not start with it)",
+        )
+            .into_response();
+    }
     {
         let mut cache = st.config.lock().unwrap();
         // File lock: a concurrent `tokens generate` must not be clobbered.
@@ -1043,7 +1079,7 @@ async fn api_roots_add(
             Ok(f) => f,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
-        cache.mtime = config::mtime_ms(&st.config_path);
+        cache.stamp = config::file_stamp(&st.config_path);
         cache.file = fresh;
     }
     rescan_roots(&st).await;
@@ -1097,7 +1133,7 @@ async fn api_roots_remove(
             }
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
-        cache.mtime = config::mtime_ms(&st.config_path);
+        cache.stamp = config::file_stamp(&st.config_path);
         cache.file = fresh;
     }
     if !removed {
@@ -1201,7 +1237,7 @@ async fn api_tokens_generate(
             }
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
-        cache.mtime = config::mtime_ms(&st.config_path);
+        cache.stamp = config::file_stamp(&st.config_path);
         cache.file = fresh;
     }
     let tokens = tokens_json(&st.config.lock().unwrap().file);
@@ -1240,7 +1276,7 @@ async fn api_tokens_revoke(
             }
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
-        cache.mtime = config::mtime_ms(&st.config_path);
+        cache.stamp = config::file_stamp(&st.config_path);
         cache.file = fresh;
     }
     if !removed {
@@ -1326,6 +1362,22 @@ mod auth {
         password: String,
         token: String,
         failures: AtomicU32,
+        /// One password check at a time: the backoff sleep only limits guessing
+        /// throughput if attempts cannot simply run in parallel.
+        gate: tokio::sync::Semaphore,
+    }
+
+    /// Equality that takes the same time for any two inputs up to 256 bytes,
+    /// so neither a password nor a session token leaks its length or a
+    /// matching prefix through timing.
+    fn fixed_eq(a: &[u8], b: &[u8]) -> bool {
+        let mut diff = a.len() ^ b.len();
+        for i in 0..a.len().max(b.len()).max(256) {
+            let x = a.get(i).copied().unwrap_or(0);
+            let y = b.get(i).copied().unwrap_or(0);
+            diff |= (x ^ y) as usize;
+        }
+        diff == 0
     }
 
     impl Auth {
@@ -1337,20 +1389,12 @@ mod auth {
                 password,
                 token,
                 failures: AtomicU32::new(0),
+                gate: tokio::sync::Semaphore::new(1),
             }
         }
 
         fn check_password(&self, attempt: &str) -> bool {
-            // Constant-time-ish comparison; good enough for a LAN map viewer.
-            let a = attempt.as_bytes();
-            let b = self.password.as_bytes();
-            let mut diff = a.len() ^ b.len();
-            for i in 0..a.len().max(b.len()) {
-                let x = a.get(i).copied().unwrap_or(0);
-                let y = b.get(i).copied().unwrap_or(0);
-                diff |= (x ^ y) as usize;
-            }
-            diff == 0
+            fixed_eq(attempt.as_bytes(), self.password.as_bytes())
         }
     }
 
@@ -1359,9 +1403,11 @@ mod auth {
             .get(header::COOKIE)
             .and_then(|v| v.to_str().ok())
             .map(|cookies| {
-                cookies
-                    .split(';')
-                    .any(|c| c.trim() == format!("xt_session={}", auth.token))
+                cookies.split(';').any(|c| {
+                    c.trim()
+                        .strip_prefix("xt_session=")
+                        .is_some_and(|v| fixed_eq(v.as_bytes(), auth.token.as_bytes()))
+                })
             })
             .unwrap_or(false)
     }
@@ -1425,6 +1471,9 @@ button{background:#4f8ef7;color:#fff;border:none;cursor:pointer}</style>
         State(auth): State<Arc<Auth>>,
         Form(form): Form<LoginForm>,
     ) -> Response {
+        // Serialized: a thousand parallel guesses would otherwise each be
+        // answered after one backoff, not one after another.
+        let _permit = auth.gate.acquire().await;
         if !auth.check_password(&form.password) {
             // Linear backoff against guessing.
             let n = auth.failures.fetch_add(1, Ordering::Relaxed).min(20);
@@ -2335,7 +2384,13 @@ fn tile_blocking(
     let span = 1i64 << (-z);
     let full_tier = (TILE >> (-z)) > THUMB;
     let stamp = if full_tier {
-        let in_range = regions_in_range(&index, &buckets, x as i64 * span, y as i64 * span, span);
+        let mut in_range =
+            regions_in_range(&index, &buckets, x as i64 * span, y as i64 * span, span);
+        // Bucket order is HashMap order, which changes with every index
+        // rebuild; the stamp must not, or every live change anywhere would
+        // re-decode every mid-zoom tile. Sort so unchanged content keeps its
+        // ETag.
+        in_range.sort_unstable();
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         in_range.len().hash(&mut h);
@@ -2473,6 +2528,20 @@ fn store_dir(index: &RegionIndex, map: &MapId) -> String {
         Some((o, s)) => format!("{dir}{SEP}roof{o},{s}"),
         None => dir,
     }
+}
+
+/// Drops the bbox-prefetch memo for one tile (see the compose path).
+fn forget_prefetch(
+    st: &AppState,
+    index: &RegionIndex,
+    map: &MapId,
+    x0: i64,
+    y0: i64,
+    span: i64,
+    tier: Tier,
+) {
+    let key = (store_dir(index, map), x0, y0, span, tier == Tier::Thumb);
+    lock_ok(&st.prefetched).remove(&key);
 }
 
 fn thumb_key(map: &MapId, rx: i32, rz: i32, mtime_ms: u64) -> ThumbKey {
@@ -2624,6 +2693,13 @@ fn tile_rgba(
         if cold.len() > WARM_SYNC_BUDGET && tier != Tier::Full {
             prefetch_store(st, index, map, x0, y0, span, tier);
             cold = cold_regions(st, map, &cold, tier);
+            if cold.len() > WARM_SYNC_BUDGET {
+                // The memo assumes what the prefetch loaded is still in the
+                // RAM tier. Still cold means it is not (evicted, or never
+                // stored): the next request must ask the store again rather
+                // than skip on an unchanged write count.
+                forget_prefetch(st, index, map, x0, y0, span, tier);
+            }
         }
         // Decoding thousands of cold regions inline means a viewer staring at
         // nothing for a minute. Past the synchronous budget, answer now — with
@@ -2872,6 +2948,37 @@ fn regions_in_range(
     out
 }
 
+/// Why a region produced no imagery.
+enum RegionMiss {
+    /// Not in the index, or vanished/unreadable on disk — normal on a live
+    /// archive mid-rename, and not worth remembering.
+    Gone,
+    /// Read fine but will not decode: reported to diagnostics, and worth
+    /// remembering so it is not re-read on every warm round.
+    Undecodable,
+}
+
+/// Decodes and renders one region at full size.
+fn render_region_checked(
+    st: &AppState,
+    index: &RegionIndex,
+    rx: i32,
+    rz: i32,
+    opts: &RenderOpts,
+) -> Result<Vec<u8>, RegionMiss> {
+    let path = index.region_path(rx, rz).ok_or(RegionMiss::Gone)?;
+    let bytes = std::fs::read(&path).map_err(|_| RegionMiss::Gone)?;
+    match xaero_core::read_region_container(&bytes)
+        .and_then(|stream| xaero_core::decode_region(&stream))
+    {
+        Ok(dec) => Ok(xaero_core::render::render_region(&dec, &st.ct, opts)),
+        Err(e) => {
+            note_unreadable(st, &path, &e.to_string());
+            Err(RegionMiss::Undecodable)
+        }
+    }
+}
+
 /// Decodes and renders one region at full size. `None` when the file is gone,
 /// unreadable or undecodable — a bad region must leave a hole, never fail the
 /// whole tile.
@@ -2882,19 +2989,7 @@ fn render_region_at(
     rz: i32,
     opts: &RenderOpts,
 ) -> Option<Vec<u8>> {
-    let path = index.region_path(rx, rz)?;
-    // A region that vanished mid-rename is normal on a live archive and not
-    // worth reporting; one that will not decode is.
-    let bytes = std::fs::read(&path).ok()?;
-    match xaero_core::read_region_container(&bytes)
-        .and_then(|stream| xaero_core::decode_region(&stream))
-    {
-        Ok(dec) => Some(xaero_core::render::render_region(&dec, &st.ct, opts)),
-        Err(e) => {
-            note_unreadable(st, &path, &e.to_string());
-            None
-        }
-    }
+    render_region_checked(st, index, rx, rz, opts).ok()
 }
 
 /// Background thumbnail work, one entry per tile request that ran past the
@@ -3206,9 +3301,21 @@ fn region_thumb(
             }
         }
     }
-    let rgba = render_region_at(st, index, rx, rz, opts)?;
-    let thumb = Arc::new(downscale_box_from(&rgba, TILE, THUMB));
-    let mip = Arc::new(downscale_box_from(&thumb, THUMB, MIP));
+    let (thumb, mip) = match render_region_checked(st, index, rx, rz, opts) {
+        Ok(rgba) => {
+            let thumb = Arc::new(downscale_box_from(&rgba, TILE, THUMB));
+            let mip = Arc::new(downscale_box_from(&thumb, THUMB, MIP));
+            (thumb, mip)
+        }
+        Err(RegionMiss::Gone) => return None,
+        // A hole, remembered under this on-disk version like any other
+        // thumbnail: the file is read once per version instead of on every
+        // warm round, and the tile stops counting it as cold.
+        Err(RegionMiss::Undecodable) => (
+            Arc::new(vec![0u8; THUMB * THUMB * 4]),
+            Arc::new(vec![0u8; MIP * MIP * 4]),
+        ),
+    };
     st.thumbs
         .lock()
         .unwrap()
@@ -3558,6 +3665,12 @@ fn highlight_tile_blocking(
     let size = encoded.as_ref().map(|p| p.len()).unwrap_or(0) + 64;
     st.tiles.lock().unwrap().put(key, encoded.clone(), size);
     Ok(TileResp::Full(encoded, etag))
+}
+
+/// Locks a std mutex, taking the data back from a poisoned one: a panic in
+/// some earlier holder must not turn every later request into a 500.
+pub(crate) fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn now_ms() -> u64 {

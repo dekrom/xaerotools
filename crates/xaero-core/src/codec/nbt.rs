@@ -8,6 +8,11 @@
 
 use super::{Eof, Rd};
 
+/// Nesting limit, the same 512 `NbtIo` enforces. Deeper input is corrupt (or
+/// hostile: a nested list costs five bytes a level), and recursing into it
+/// would overflow the stack long before the stream ran out.
+const MAX_DEPTH: u32 = 512;
+
 pub const TAG_END: u8 = 0;
 pub const TAG_BYTE: u8 = 1;
 pub const TAG_SHORT: u8 = 2;
@@ -40,9 +45,9 @@ pub(crate) fn read_named_nbt(rd: &mut Rd<'_>) -> Result<RawNbt, Eof> {
         let name_len = rd.u16()? as usize;
         rd.take(name_len)?;
         if tag == TAG_COMPOUND {
-            name = skim_compound(rd, true)?;
+            name = skim_compound(rd, true, 0)?;
         } else {
-            skim_payload(rd, tag)?;
+            skim_payload(rd, tag, 0)?;
         }
     }
     Ok(RawNbt {
@@ -53,7 +58,10 @@ pub(crate) fn read_named_nbt(rd: &mut Rd<'_>) -> Result<RawNbt, Eof> {
 
 /// Skims a compound payload; when `want_name`, returns the value of the
 /// first top-level "Name" string entry found.
-fn skim_compound(rd: &mut Rd<'_>, want_name: bool) -> Result<Option<String>, Eof> {
+fn skim_compound(rd: &mut Rd<'_>, want_name: bool, depth: u32) -> Result<Option<String>, Eof> {
+    if depth > MAX_DEPTH {
+        return Err(Eof);
+    }
     let mut found: Option<String> = None;
     loop {
         let tag = rd.u8()?;
@@ -67,12 +75,15 @@ fn skim_compound(rd: &mut Rd<'_>, want_name: bool) -> Result<Option<String>, Eof
             let bytes = rd.take(len)?;
             found = Some(decode_java_utf(bytes));
         } else {
-            skim_payload(rd, tag)?;
+            skim_payload(rd, tag, depth + 1)?;
         }
     }
 }
 
-fn skim_payload(rd: &mut Rd<'_>, tag: u8) -> Result<(), Eof> {
+fn skim_payload(rd: &mut Rd<'_>, tag: u8, depth: u32) -> Result<(), Eof> {
+    if depth > MAX_DEPTH {
+        return Err(Eof);
+    }
     match tag {
         TAG_BYTE => {
             rd.take(1)?;
@@ -99,11 +110,11 @@ fn skim_payload(rd: &mut Rd<'_>, tag: u8) -> Result<(), Eof> {
             let n = rd.i32()?;
             let n = usize::try_from(n).unwrap_or(0);
             for _ in 0..n {
-                skim_payload(rd, elem)?;
+                skim_payload(rd, elem, depth + 1)?;
             }
         }
         TAG_COMPOUND => {
-            skim_compound(rd, false)?;
+            skim_compound(rd, false, depth + 1)?;
         }
         TAG_INT_ARRAY => {
             let n = rd.i32()?;
@@ -237,6 +248,27 @@ mod tests {
     #[test]
     fn truncated_nbt_is_eof() {
         let raw = [0x0A, 0x00, 0x00, 0x08, 0x00, 0x04, b'N'];
+        let mut rd = Rd::new(&raw);
+        assert!(read_named_nbt(&mut rd).is_err());
+    }
+
+    /// Lists nested a hundred thousand deep must come back as an error, not
+    /// as a stack overflow: five bytes a level is cheap for an attacker.
+    #[test]
+    fn absurd_nesting_is_rejected() {
+        let mut raw = vec![0x0A, 0x00, 0x00, 0x09, 0x00, 0x01, b'l'];
+        for _ in 0..100_000 {
+            // TAG_List of one TAG_List
+            raw.extend_from_slice(&[0x09, 0x00, 0x00, 0x00, 0x01]);
+        }
+        raw.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let mut rd = Rd::new(&raw);
+        assert!(read_named_nbt(&mut rd).is_err());
+
+        let mut raw = vec![0x0A, 0x00, 0x00];
+        for _ in 0..100_000 {
+            raw.extend_from_slice(&[0x0A, 0x00, 0x00]); // nested compound, empty name
+        }
         let mut rd = Rd::new(&raw);
         assert!(read_named_nbt(&mut rd).is_err());
     }

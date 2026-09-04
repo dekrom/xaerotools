@@ -337,3 +337,37 @@ fn doctor_finds_regions_that_survive_only_as_copies() {
     assert_eq!(conflict["count"], 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A flag left without its value, a malformed --alias or --prefer, and
+/// `--port 0` are usage errors (exit 2 with a message), never an index panic
+/// with a backtrace (exit 101). `help` is not an error.
+#[test]
+fn usage_errors_do_not_panic() {
+    for args in [
+        &["serve", "--root"][..],
+        &["merge", "a", "b", "-o"],
+        &["merge", "a", "b", "-o", "out", "--alias", "no-equals"],
+        &["merge", "a", "b", "-o", "out", "--prefer", "B"],
+        &["serve", "--port", "0"],
+        &["render", "--bbox"],
+        &["stats", "--sample"],
+        &["doctor", "--world"],
+        &["tokens", "list", "--config"],
+        &["waypoints", "list", "--vault"],
+    ] {
+        let out = xt(args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("panicked"),
+            "{args:?} panicked"
+        );
+    }
+    assert_eq!(xt(&["help"]).status.code(), Some(0));
+    assert_eq!(xt(&["--help"]).status.code(), Some(0));
+    assert_eq!(xt(&["bogus"]).status.code(), Some(2));
+}

@@ -38,53 +38,44 @@ pub fn render_cmd(args: &[String]) {
     while i < args.len() {
         match args[i].as_str() {
             "--root" => {
-                i += 1;
-                roots.push(PathBuf::from(&args[i]));
+                roots.push(PathBuf::from(crate::value(args, &mut i, "--root")));
             }
             "--world" => {
-                i += 1;
-                world = Some(args[i].clone());
+                world = Some(crate::value(args, &mut i, "--world"));
             }
             "--dim" => {
-                i += 1;
-                dim = Some(args[i].clone());
+                dim = Some(crate::value(args, &mut i, "--dim"));
             }
             "--mw" => {
-                i += 1;
-                mw = Some(args[i].clone());
+                mw = Some(crate::value(args, &mut i, "--mw"));
             }
             "--layer" => {
-                i += 1;
-                layer = Some(args[i].clone());
+                layer = Some(crate::value(args, &mut i, "--layer"));
             }
             "--cave" => {
-                i += 1;
-                layer = Some(format!("cave:{}", args[i]));
+                layer = Some(format!("cave:{}", crate::value(args, &mut i, "--cave")));
             }
             "--bbox" => {
-                i += 1;
-                bbox = Some(parse_bbox(&args[i]));
+                bbox = Some(parse_bbox(&crate::value(args, &mut i, "--bbox")));
             }
             "--roof" => roof = Some(crate::ROOF_DEFAULT),
             "--all" => all = true,
             "--zoom" => {
-                i += 1;
-                cell = cell_from_zoom(&args[i]);
+                cell = cell_from_zoom(&crate::value(args, &mut i, "--zoom"));
             }
             "--scale" => {
-                i += 1;
-                cell = cell_from_scale(&args[i]);
+                cell = cell_from_scale(&crate::value(args, &mut i, "--scale"));
             }
             "--max-px" => {
-                i += 1;
-                max_px = args[i].parse().unwrap_or_else(|_| {
-                    eprintln!("--max-px must be a number");
-                    std::process::exit(2);
-                });
+                max_px = crate::value(args, &mut i, "--max-px")
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        eprintln!("--max-px must be a number");
+                        std::process::exit(2);
+                    });
             }
             "-o" => {
-                i += 1;
-                out = Some(PathBuf::from(&args[i]));
+                out = Some(PathBuf::from(crate::value(args, &mut i, "-o")));
             }
             other => {
                 eprintln!("unknown arg: {other}");

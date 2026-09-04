@@ -124,13 +124,24 @@ pub fn discover_root(path: &Path) -> Vec<World> {
     worlds
 }
 
+/// Directory test that follows symlinks. `DirEntry::file_type` is lstat-based,
+/// so a world, dimension or multiworld folder that is a symlink (an archive
+/// linked into `.minecraft/xaero/`) would otherwise be skipped entirely.
+fn entry_is_dir(e: &std::fs::DirEntry) -> bool {
+    match e.file_type() {
+        Ok(ft) if ft.is_dir() => true,
+        Ok(ft) if ft.is_symlink() => e.path().is_dir(),
+        _ => false,
+    }
+}
+
 fn scan_world_map_root(wm_root: &Path, mm_root: Option<&Path>) -> Vec<World> {
     let Ok(entries) = std::fs::read_dir(wm_root) else {
         return Vec::new();
     };
     let mut worlds: Vec<World> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(entry_is_dir)
         .filter_map(|e| {
             let p = e.path();
             looks_like_world_dir(&p)
@@ -155,7 +166,7 @@ fn append_minimap_only_worlds(mm_root: &Path, worlds: &mut Vec<World>) {
         if is_minimap_backup_dir_name(&id) || id == "temp_to_add" {
             continue;
         }
-        if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if !entry_is_dir(&e) {
             continue;
         }
         if worlds.iter().any(|w| w.id == id) {
@@ -192,7 +203,7 @@ fn collect_waypoint_files(mm_world_dir: &Path) -> Vec<(String, PathBuf)> {
         if is_minimap_backup_dir_name(&dname) || dname == "temp_to_add" {
             continue;
         }
-        if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if !entry_is_dir(&e) {
             continue;
         }
         let Ok(files) = std::fs::read_dir(e.path()) else {
@@ -219,10 +230,10 @@ fn looks_like_world_dir(p: &Path) -> bool {
     entries.filter_map(|e| e.ok()).any(|e| {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        let Ok(ft) = e.file_type() else { return false };
-        if ft.is_dir() {
+        if entry_is_dir(&e) {
             return Dimension::from_worldmap_folder(&name).is_some();
         }
+        let Ok(ft) = e.file_type() else { return false };
         // A world can hold nothing but XaeroPlus highlight databases: that is
         // how a shared server's world starts when a client sends chunk finds
         // before it has uploaded a region. `scan_world` already handles the
@@ -258,8 +269,7 @@ fn scan_world(world_dir: &Path, mm_root: Option<&Path>) -> Option<World> {
     for entry in std::fs::read_dir(world_dir).ok()?.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
         let path = entry.path();
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
+        if entry_is_dir(&entry) {
             let dimension = Dimension::from_worldmap_folder(&name);
             let has_config = path.join("dimension_config.txt").is_file();
             if dimension.is_none() && !has_config {
@@ -284,7 +294,10 @@ fn scan_world(world_dir: &Path, mm_root: Option<&Path>) -> Option<World> {
                 config,
                 multiworlds,
             });
-        } else if ft.is_file() && name.ends_with(".db") {
+        } else if path.is_file() && name.starts_with("XaeroPlus") && name.ends_with(".db") {
+            // Only the mod's own databases: its recovery path leaves
+            // `recovered_*`/`corrupted_*` copies beside them, and those must
+            // not become overlays or merge inputs.
             databases.push(name);
         }
     }
@@ -324,7 +337,7 @@ fn scan_multiworlds(dim_dir: &Path, config: &DimensionConfig) -> Vec<MwEntry> {
     };
     let mut mws: Vec<MwEntry> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(entry_is_dir)
         .filter_map(|e| {
             let id = e.file_name().to_string_lossy().to_string();
             if !is_multiworld_folder(&id) {
@@ -334,7 +347,7 @@ fn scan_multiworlds(dim_dir: &Path, config: &DimensionConfig) -> Vec<MwEntry> {
                 .map(|caves| {
                     caves
                         .filter_map(|c| c.ok())
-                        .filter(|c| c.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                        .filter(entry_is_dir)
                         .filter_map(|c| c.file_name().to_string_lossy().parse::<i32>().ok())
                         .collect()
                 })
@@ -396,8 +409,7 @@ pub fn index_regions(map_dir: &Path) -> std::io::Result<RegionIndex> {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
+        if entry_is_dir(&entry) {
             // `cache*`, `caves`, and `<version>_backup_<n>` — the last of which
             // holds pre-conversion copies that shadow live coordinates and so
             // must stay out of the live index. See `scan_region_alternates`.
@@ -469,8 +481,7 @@ pub fn scan_region_alternates(map_dir: &Path) -> std::io::Result<Vec<RegionAlter
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
+        if entry_is_dir(&entry) {
             if let Some((version, index)) = parse_backup_dir_name(&name) {
                 backup_dirs.push((version, index, entry.path()));
             }
@@ -524,7 +535,9 @@ pub fn scan_region_alternates(map_dir: &Path) -> std::io::Result<Vec<RegionAlter
 }
 
 fn region_meta(entry: &std::fs::DirEntry, is_zip: bool) -> Option<RegionMeta> {
-    let md = entry.metadata().ok()?;
+    // `DirEntry::metadata` is an lstat: a symlinked region would report the
+    // link's own size and mtime, and mtime is the merge's recency signal.
+    let md = std::fs::metadata(entry.path()).ok()?;
     let mtime_ms = md
         .modified()
         .ok()
@@ -679,7 +692,7 @@ fn scan_minimap_tree(tree: &Path, kind: WaypointSourceKind, out: &mut Vec<Waypoi
     };
     for w in worlds.filter_map(|e| e.ok()) {
         let world = w.file_name().to_string_lossy().to_string();
-        if !w.file_type().map(|t| t.is_dir()).unwrap_or(false) || world == "temp_to_add" {
+        if !entry_is_dir(&w) || world == "temp_to_add" {
             continue;
         }
         if is_minimap_backup_dir_name(&world) {
@@ -703,7 +716,7 @@ fn scan_minimap_world(
     };
     for e in entries.filter_map(|e| e.ok()) {
         let name = e.file_name().to_string_lossy().to_string();
-        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if entry_is_dir(&e) {
             if is_minimap_backup_dir_name(&name) {
                 // <world>/backup/ holds a copy of the dimension folders.
                 scan_minimap_world(&e.path(), world, WaypointSourceKind::Archived, tree, out);
@@ -933,6 +946,41 @@ mod tests {
         assert!(worlds[0].dims.is_empty());
         assert_eq!(worlds[0].databases, vec!["XaeroPlusNewChunks.db"]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn follows_symlinked_dirs_and_regions() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("xt-scan-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        // The real archive lives elsewhere; the scanned root only links to it.
+        let real = base.join("archive").join("Multiplayer_2b2t");
+        let layer = real.join("null").join("mw$default");
+        std::fs::create_dir_all(&layer).unwrap();
+        std::fs::write(layer.join("0_0.zip"), b"x").unwrap();
+        let real_region = base.join("elsewhere").join("3_4.zip");
+        std::fs::create_dir_all(real_region.parent().unwrap()).unwrap();
+        std::fs::write(&real_region, b"twelve bytes").unwrap();
+        symlink(&real_region, layer.join("3_4.zip")).unwrap();
+        std::fs::write(real.join("XaeroPlusNewChunks.db"), b"").unwrap();
+        std::fs::write(real.join("recovered_XaeroPlusNewChunks-1.db"), b"").unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("world-map")).unwrap();
+        symlink(&real, root.join("world-map").join("Multiplayer_2b2t")).unwrap();
+
+        let worlds = discover_root(&root);
+        assert_eq!(worlds.len(), 1, "symlinked world dir is discovered");
+        let w = &worlds[0];
+        assert_eq!(w.dims.len(), 1);
+        assert_eq!(w.dims[0].multiworlds.len(), 1);
+        assert_eq!(w.databases, vec!["XaeroPlusNewChunks.db"]);
+
+        let idx = index_regions(&root.join("world-map/Multiplayer_2b2t/null/mw$default")).unwrap();
+        assert_eq!(idx.entries.len(), 2);
+        let linked = idx.entries.get(&(3, 4)).expect("symlinked region indexed");
+        assert_eq!(linked.size, 12, "size of the target, not the link");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -34,6 +34,14 @@ pub enum Prefer {
 pub struct MergeOptions {
     pub apply: bool,
     pub prefer: Prefer,
+    /// Continue a merge that was interrupted: outputs already present are left
+    /// alone instead of being rewritten, and OUT no longer has to be empty.
+    ///
+    /// A copied region is only trusted when its size matches the source, so a
+    /// file truncated by the interruption is written again rather than kept.
+    /// Merged conflict regions are written via a temporary file and renamed,
+    /// so their mere presence already means they are complete.
+    pub resume: bool,
     /// Only merge worlds whose id matches one of these (empty = all).
     pub servers: Vec<String>,
     /// Explicit world-id pairings "A-id=B-id".
@@ -47,6 +55,7 @@ impl Default for MergeOptions {
         MergeOptions {
             apply: false,
             prefer: Prefer::Mtime,
+            resume: false,
             servers: Vec::new(),
             aliases: Vec::new(),
             auto_alias: false,
@@ -76,6 +85,9 @@ pub struct MergeReport {
     pub waypoint_files_merged: usize,
     pub dbs: Vec<xaero_db::merge::DbMergeReport>,
     pub suggested_aliases: Vec<(String, String)>,
+    /// Things that changed the plan without losing data — a world that could
+    /// not be paired because its partner was already taken, for instance.
+    pub warnings: Vec<String>,
 }
 
 impl MergeReport {
@@ -100,6 +112,46 @@ pub fn merge_to_output(
         ..Default::default()
     };
 
+    // Sources are never written to, and the output must not sit inside (or
+    // around) either of them: `fs::copy(x, x)` truncates x to nothing.
+    let a_canon = a_root
+        .canonicalize()
+        .map_err(|e| format!("A root {}: {e}", a_root.display()))?;
+    let b_canon = b_root
+        .canonicalize()
+        .map_err(|e| format!("B root {}: {e}", b_root.display()))?;
+    if a_canon == b_canon {
+        return Err(format!(
+            "A and B are the same directory: {}",
+            a_canon.display()
+        ));
+    }
+    let out_canon = canonical_or_parent(out)
+        .ok_or_else(|| format!("cannot resolve output path {}", out.display()))?;
+    for (side, src) in [("A", &a_canon), ("B", &b_canon)] {
+        if out_canon.starts_with(src) || src.starts_with(&out_canon) {
+            return Err(format!(
+                "output {} overlaps {side} root {} — sources are never written to",
+                out.display(),
+                src.display()
+            ));
+        }
+    }
+    // --resume exists precisely to continue into a half-written OUT, so the
+    // empty-output guard would defeat it.
+    if !opts.resume
+        && out.exists()
+        && out
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(true)
+    {
+        return Err(format!(
+            "output {} already exists and is not empty (pass --resume to continue an interrupted merge into it)",
+            out.display()
+        ));
+    }
+
     let worlds_a = discover_root(a_root);
     let worlds_b = discover_root(b_root);
     if worlds_a.is_empty() {
@@ -112,47 +164,68 @@ pub fn merge_to_output(
     let keep = |id: &str| opts.servers.is_empty() || opts.servers.iter().any(|s| s == id);
 
     // ---- pair worlds -------------------------------------------------------
+    // Exact ids first, then explicit aliases, then the base-domain heuristic:
+    // a B world pairs at most once, and the strongest claim on it wins
+    // whatever order the directories come in. Two A worlds landing on one B
+    // world would otherwise both write OUT/world-map/<B id>, the second run
+    // straight over the first.
     let mut pairs: Vec<(&World, &World)> = Vec::new();
     let mut used_b: BTreeSet<usize> = BTreeSet::new();
-    for wa in &worlds_a {
-        if !keep(&wa.id) {
-            continue;
-        }
-        let mut matched: Option<usize> = None;
-        for (i, wb) in worlds_b.iter().enumerate() {
-            let aliased = opts
-                .aliases
-                .iter()
-                .any(|(x, y)| (*x == wa.id && *y == wb.id) || (*x == wb.id && *y == wa.id));
-            if wb.id == wa.id || aliased {
+    let mut paired_a: BTreeSet<usize> = BTreeSet::new();
+    let aliased = |x: &str, y: &str| {
+        opts.aliases
+            .iter()
+            .any(|(p, q)| (*p == x && *q == y) || (*p == y && *q == x))
+    };
+    for pass in 0..3 {
+        for (ai, wa) in worlds_a.iter().enumerate() {
+            if !keep(&wa.id) || paired_a.contains(&ai) {
+                continue;
+            }
+            let mut matched: Option<usize> = None;
+            for (i, wb) in worlds_b.iter().enumerate() {
+                let hit = match pass {
+                    0 => wb.id == wa.id,
+                    1 => aliased(&wa.id, &wb.id),
+                    _ => base_domain_match(&wa.id, &wb.id),
+                };
+                if !hit {
+                    continue;
+                }
+                if used_b.contains(&i) {
+                    let by = pairs
+                        .iter()
+                        .find(|(_, b)| b.id == wb.id)
+                        .map(|(a, _)| a.id.clone())
+                        .unwrap_or_default();
+                    report.warnings.push(format!(
+                        "{} (A) also matches {} (B), which is already paired with {} (A) — copied whole under its own name instead",
+                        wa.id, wb.id, by
+                    ));
+                    break;
+                }
+                if pass == 2 && !opts.auto_alias {
+                    report
+                        .suggested_aliases
+                        .push((wa.id.clone(), wb.id.clone()));
+                    break;
+                }
                 matched = Some(i);
                 break;
             }
-        }
-        if matched.is_none() {
-            // Base-domain heuristic: Multiplayer_2b2t <-> Multiplayer_2b2t.org
-            for (i, wb) in worlds_b.iter().enumerate() {
-                if base_domain_match(&wa.id, &wb.id) {
-                    if opts.auto_alias {
-                        matched = Some(i);
-                    } else {
-                        report
-                            .suggested_aliases
-                            .push((wa.id.clone(), wb.id.clone()));
-                    }
-                    break;
-                }
-            }
-        }
-        match matched {
-            Some(i) => {
+            if let Some(i) = matched {
                 used_b.insert(i);
+                paired_a.insert(ai);
                 pairs.push((wa, &worlds_b[i]));
                 report
                     .world_pairs
                     .push((wa.id.clone(), worlds_b[i].id.clone()));
             }
-            None => report.only_worlds.push(format!("{} (A only)", wa.id)),
+        }
+    }
+    for (ai, wa) in worlds_a.iter().enumerate() {
+        if keep(&wa.id) && !paired_a.contains(&ai) {
+            report.only_worlds.push(format!("{} (A only)", wa.id));
         }
     }
     for (i, wb) in worlds_b.iter().enumerate() {
@@ -162,14 +235,14 @@ pub fn merge_to_output(
     }
 
     // ---- unpaired worlds: wholesale copy -----------------------------------
-    for wa in &worlds_a {
-        if keep(&wa.id) && !pairs.iter().any(|(a, _)| a.id == wa.id) {
-            copy_world_tree(wa, out, opts.apply, &mut report)?;
+    for (ai, wa) in worlds_a.iter().enumerate() {
+        if keep(&wa.id) && !paired_a.contains(&ai) {
+            copy_world_tree(wa, out, opts.apply, opts.resume, &mut report)?;
         }
     }
     for (i, wb) in worlds_b.iter().enumerate() {
         if keep(&wb.id) && !used_b.contains(&i) {
-            copy_world_tree(wb, out, opts.apply, &mut report)?;
+            copy_world_tree(wb, out, opts.apply, opts.resume, &mut report)?;
         }
     }
 
@@ -203,24 +276,67 @@ fn mtime_of(p: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Canonical form of a path that may not exist yet: its nearest existing
+/// ancestor resolved, the missing tail re-appended.
+fn canonical_or_parent(p: &Path) -> Option<std::path::PathBuf> {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(p)
+    };
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = abs.as_path();
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            let mut out = c;
+            for t in tail.iter().rev() {
+                out.push(t);
+            }
+            return Some(out);
+        }
+        tail.push(cur.file_name()?.to_os_string());
+        cur = cur.parent()?;
+    }
+}
+
 fn copy_preserving_mtime(from: &Path, to: &Path) -> Result<(), String> {
+    if let (Ok(f), Ok(t)) = (from.canonicalize(), to.canonicalize()) {
+        if f == t {
+            return Err(format!("refusing to copy {} onto itself", from.display()));
+        }
+    }
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     std::fs::copy(from, to)
         .map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))?;
-    if let Ok(md) = std::fs::metadata(from) {
-        if let Ok(t) = md.modified() {
-            let _ = filetime::set_file_mtime(to, filetime::FileTime::from_system_time(t));
-        }
-    }
+    // mtime is the merge's only recency signal; a copy that lost it would
+    // win every later tiebreak, so failing to carry it over is a failure.
+    let t = std::fs::metadata(from)
+        .and_then(|md| md.modified())
+        .map_err(|e| format!("mtime of {}: {e}", from.display()))?;
+    filetime::set_file_mtime(to, filetime::FileTime::from_system_time(t))
+        .map_err(|e| format!("set mtime {}: {e}", to.display()))?;
     Ok(())
 }
 
-fn set_mtime_ms(path: &Path, ms: u64) {
+/// `copy_preserving_mtime`, but on a resumed run an output that is already
+/// there at the right size is left untouched.
+fn copy_unless_present(from: &Path, to: &Path, resume: bool) -> Result<(), String> {
+    if resume {
+        if let (Ok(dst), Ok(src)) = (std::fs::metadata(to), std::fs::metadata(from)) {
+            if dst.len() == src.len() {
+                return Ok(());
+            }
+        }
+    }
+    copy_preserving_mtime(from, to)
+}
+
+fn set_mtime_ms(path: &Path, ms: u64) -> Result<(), String> {
     let ft =
         filetime::FileTime::from_unix_time((ms / 1000) as i64, ((ms % 1000) * 1_000_000) as u32);
-    let _ = filetime::set_file_mtime(path, ft);
+    filetime::set_file_mtime(path, ft).map_err(|e| format!("set mtime {}: {e}", path.display()))
 }
 
 /// Copies one world tree (minus caches, temp files and the mod's own backups)
@@ -233,64 +349,92 @@ fn copy_world_tree(
     w: &World,
     out: &Path,
     apply: bool,
+    resume: bool,
     report: &mut MergeReport,
 ) -> Result<(), String> {
     if let Some(wm) = &w.world_map_path {
-        let dst_world = out.join("world-map").join(&w.id);
-        let mut stack = vec![wm.clone()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let path = entry.path();
-                let Ok(ft) = entry.file_type() else { continue };
-                if ft.is_dir() {
-                    // Caches are derived, and the mod's own snapshots
-                    // (`<version>_backup_<n>/`, `XaeroPlus-db-backups/`) are
-                    // superseded copies — on a real archive the DB backups
-                    // alone run to tens of gigabytes.
-                    if is_cache_dir_name(&name)
-                        || name == xaero_core::naming::DB_BACKUP_DIR
-                        || xaero_core::naming::parse_backup_dir_name(&name).is_some()
-                    {
-                        continue;
-                    }
-                    stack.push(path);
-                } else if !xaero_core::naming::is_transient_artifact(&name) {
-                    let rel = path.strip_prefix(wm).unwrap();
-                    report.aux_copied += 1;
-                    if apply {
-                        copy_preserving_mtime(&path, &dst_world.join(rel))?;
-                    }
+        copy_world_map_tree(
+            wm,
+            &out.join("world-map").join(&w.id),
+            apply,
+            resume,
+            report,
+        )?;
+    }
+    if let Some(mm) = &w.minimap_path {
+        copy_minimap_tree(mm, &out.join("minimap").join(&w.id), apply, resume, report)?;
+    }
+    Ok(())
+}
+
+/// The world-map half of a world, copied whole into `dst_world`.
+fn copy_world_map_tree(
+    wm: &Path,
+    dst_world: &Path,
+    apply: bool,
+    resume: bool,
+    report: &mut MergeReport,
+) -> Result<(), String> {
+    let mut stack = vec![wm.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                // Caches are derived, and the mod's own snapshots
+                // (`<version>_backup_<n>/`, `XaeroPlus-db-backups/`) are
+                // superseded copies — on a real archive the DB backups
+                // alone run to tens of gigabytes.
+                if is_cache_dir_name(&name)
+                    || name == xaero_core::naming::DB_BACKUP_DIR
+                    || xaero_core::naming::parse_backup_dir_name(&name).is_some()
+                {
+                    continue;
+                }
+                stack.push(path);
+            } else if !xaero_core::naming::is_transient_artifact(&name) {
+                let rel = path.strip_prefix(wm).unwrap();
+                report.aux_copied += 1;
+                if apply {
+                    copy_unless_present(&path, &dst_world.join(rel), resume)?;
                 }
             }
         }
     }
-    // Minimap side (waypoints + config).
-    if let Some(mm) = &w.minimap_path {
-        let dst_mm = out.join("minimap").join(&w.id);
-        let mut stack = vec![mm.clone()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let path = entry.path();
-                let Ok(ft) = entry.file_type() else { continue };
-                if ft.is_dir() {
-                    if xaero_core::naming::is_minimap_backup_dir_name(&name) {
-                        continue;
-                    }
-                    stack.push(path);
-                } else if !xaero_core::naming::is_transient_artifact(&name) {
-                    let rel = path.strip_prefix(mm).unwrap();
-                    report.aux_copied += 1;
-                    if apply {
-                        copy_preserving_mtime(&path, &dst_mm.join(rel))?;
-                    }
+    Ok(())
+}
+
+/// The minimap half of a world (waypoints + config), copied whole into `dst_mm`.
+fn copy_minimap_tree(
+    mm: &Path,
+    dst_mm: &Path,
+    apply: bool,
+    resume: bool,
+    report: &mut MergeReport,
+) -> Result<(), String> {
+    let mut stack = vec![mm.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path();
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                if xaero_core::naming::is_minimap_backup_dir_name(&name) {
+                    continue;
+                }
+                stack.push(path);
+            } else if !xaero_core::naming::is_transient_artifact(&name) {
+                let rel = path.strip_prefix(mm).unwrap();
+                report.aux_copied += 1;
+                if apply {
+                    copy_unless_present(&path, &dst_mm.join(rel), resume)?;
                 }
             }
         }
@@ -315,15 +459,91 @@ fn merge_world_pair(
     opts: &MergeOptions,
     report: &mut MergeReport,
 ) -> Result<(), String> {
-    let (Some(wma), Some(wmb)) = (&wa.world_map_path, &wb.world_map_path) else {
-        // No map layers to merge on at least one side. The minimap half still
-        // carries waypoints, so copy rather than drop the world.
-        copy_world_tree(wa, out, opts.apply, report)?;
-        copy_world_tree(wb, out, opts.apply, report)?;
-        return Ok(());
-    };
     let out_world = out.join("world-map").join(&wb.id);
+    match (&wa.world_map_path, &wb.world_map_path) {
+        (Some(wma), Some(wmb)) => {
+            merge_world_map_pair(wa, wb, wma, wmb, &out_world, opts, report)?;
+        }
+        // Map data on one side only: nothing to merge, so it is copied whole
+        // under the output's (B's) world id. The minimap halves below are
+        // still unioned — a minimap-only instance carries waypoints, and two
+        // wholesale copies would keep only the second side's.
+        (Some(wm), None) | (None, Some(wm)) => {
+            copy_world_map_tree(wm, &out_world, opts.apply, opts.resume, report)?;
+        }
+        (None, None) => {}
+    }
 
+    // Minimap waypoints: union per dim%/file.
+    let mut wp_keys: BTreeSet<(String, String)> = BTreeSet::new();
+    for w in [wa, wb] {
+        for (dim, path) in &w.waypoint_files {
+            wp_keys.insert((
+                dim.clone(),
+                path.file_name().unwrap().to_string_lossy().to_string(),
+            ));
+        }
+    }
+    for (dim, file) in &wp_keys {
+        let find = |w: &World| {
+            w.waypoint_files
+                .iter()
+                .find(|(d, p)| d == dim && p.file_name().unwrap().to_string_lossy() == *file)
+                .map(|(_, p)| p.clone())
+        };
+        let pa = find(wa);
+        let pb = find(wb);
+        let merged = merge_waypoint_files(pa.as_deref(), pb.as_deref())?;
+        if let Some(text) = merged {
+            report.waypoint_files_merged += 1;
+            if opts.apply {
+                let to = out.join("minimap").join(&wb.id).join(dim).join(file);
+                std::fs::create_dir_all(to.parent().unwrap()).map_err(|e| e.to_string())?;
+                std::fs::write(&to, text).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    // Minimap config.txt: newer wins.
+    if let (Some(mma), Some(mmb)) = (&wa.minimap_path, &wb.minimap_path) {
+        let ca = mma.join("config.txt");
+        let cb = mmb.join("config.txt");
+        let newest = if mtime_of(&ca) >= mtime_of(&cb) {
+            &ca
+        } else {
+            &cb
+        };
+        if newest.is_file() {
+            report.aux_copied += 1;
+            if opts.apply {
+                copy_preserving_mtime(
+                    newest,
+                    &out.join("minimap").join(&wb.id).join("config.txt"),
+                )?;
+            }
+        }
+    } else if let Some(mm) = wa.minimap_path.as_ref().or(wb.minimap_path.as_ref()) {
+        let c = mm.join("config.txt");
+        if c.is_file() {
+            report.aux_copied += 1;
+            if opts.apply {
+                copy_preserving_mtime(&c, &out.join("minimap").join(&wb.id).join("config.txt"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The world-map halves of a paired world: per-layer region merge, then the
+/// aux files and XaeroPlus databases that sit beside the dimension folders.
+fn merge_world_map_pair(
+    wa: &World,
+    wb: &World,
+    wma: &Path,
+    wmb: &Path,
+    out_world: &Path,
+    opts: &MergeOptions,
+    report: &mut MergeReport,
+) -> Result<(), String> {
     // Canonical dimension key: resource key when parseable, else raw folder.
     let dim_key = |folder: &str| {
         Dimension::from_worldmap_folder(folder)
@@ -348,17 +568,31 @@ fn merge_world_pair(
                             mw: mw.id.clone(),
                             cave,
                         });
-                    if side == 'a' {
-                        unit.dim_a = Some(dim.folder.clone());
+                    let slot = if side == 'a' {
+                        &mut unit.dim_a
                     } else {
-                        unit.dim_b = Some(dim.folder.clone());
+                        &mut unit.dim_b
+                    };
+                    // `null/` and `DIM0/` are the same dimension under two
+                    // XaeroPlus settings; one side holding both cannot be
+                    // merged as a pair without silently dropping one.
+                    if let Some(prev) = slot.as_deref() {
+                        if prev != dim.folder {
+                            return Err(format!(
+                                "world {}: side {} has both {prev}/ and {}/ for the same dimension — merge those two folders first",
+                                world.id,
+                                side.to_ascii_uppercase(),
+                                dim.folder
+                            ));
+                        }
                     }
+                    *slot = Some(dim.folder.clone());
                 }
             }
         }
     }
 
-    for ((key_dim, _, _), unit) in &units {
+    for unit in units.values() {
         let dir_a = unit
             .dim_a
             .as_ref()
@@ -367,17 +601,19 @@ fn merge_world_pair(
             .dim_b
             .as_ref()
             .map(|d| layer_dir(wmb, d, &unit.mw, unit.cave));
-        let idx_a = dir_a
-            .as_deref()
-            .and_then(|d| index_regions(d).ok())
-            .unwrap_or_default();
-        let idx_b = dir_b
-            .as_deref()
-            .and_then(|d| index_regions(d).ok())
-            .unwrap_or_default();
+        // An unreadable layer must fail the run: an empty index would quietly
+        // file every region on that side as only-other-side.
+        let index = |d: Option<&Path>| -> Result<RegionIndex, String> {
+            match d {
+                Some(d) => index_regions(d).map_err(|e| format!("index {}: {e}", d.display())),
+                None => Ok(RegionIndex::default()),
+            }
+        };
+        let idx_a = index(dir_a.as_deref())?;
+        let idx_b = index(dir_b.as_deref())?;
         // Output folder name: prefer B's original name, else A's.
         let out_dim_folder = unit.dim_b.clone().or(unit.dim_a.clone()).unwrap();
-        let out_dir = layer_dir(&out_world, &out_dim_folder, &unit.mw, unit.cave);
+        let out_dir = layer_dir(out_world, &out_dim_folder, &unit.mw, unit.cave);
 
         let mut ur = UnitReport {
             world: wb.id.clone(),
@@ -398,7 +634,11 @@ fn merge_world_pair(
                 ur.only_a += 1;
                 if opts.apply {
                     let from = idx_a.region_path(coord.0, coord.1).unwrap();
-                    copy_preserving_mtime(&from, &out_dir.join(from.file_name().unwrap()))?;
+                    copy_unless_present(
+                        &from,
+                        &out_dir.join(from.file_name().unwrap()),
+                        opts.resume,
+                    )?;
                 }
             }
         }
@@ -407,7 +647,11 @@ fn merge_world_pair(
                 ur.only_b += 1;
                 if opts.apply {
                     let from = idx_b.region_path(coord.0, coord.1).unwrap();
-                    copy_preserving_mtime(&from, &out_dir.join(from.file_name().unwrap()))?;
+                    copy_unless_present(
+                        &from,
+                        &out_dir.join(from.file_name().unwrap()),
+                        opts.resume,
+                    )?;
                 }
             }
         }
@@ -418,18 +662,18 @@ fn merge_world_pair(
             let errors: Vec<String> = conflicts
                 .par_iter()
                 .filter_map(|&(rx, rz)| {
-                    merge_one_conflict(&idx_a, &idx_b, rx, rz, &out_dir, opts.prefer).err()
+                    merge_one_conflict(&idx_a, &idx_b, rx, rz, &out_dir, opts.prefer, opts.resume)
+                        .err()
                 })
                 .collect();
             ur.merge_errors = errors;
         }
-        let _ = key_dim;
         report.units.push(ur);
     }
 
     // ---- aux files ---------------------------------------------------------
     if opts.apply {
-        std::fs::create_dir_all(&out_world).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(out_world).map_err(|e| e.to_string())?;
     }
     // dimension_config.txt: union MWName lines, newer file wins for scalars.
     let mut dims_all: BTreeSet<String> = BTreeSet::new();
@@ -547,65 +791,6 @@ fn merge_world_pair(
                 xaero_db::merge::merge_into(base, &sources, false)?
             };
             report.dbs.push(dbr);
-        } else if opts.apply {
-            // base copied, nothing to merge
-        }
-    }
-
-    // Minimap waypoints: union per dim%/file.
-    let mut wp_keys: BTreeSet<(String, String)> = BTreeSet::new();
-    for w in [wa, wb] {
-        for (dim, path) in &w.waypoint_files {
-            wp_keys.insert((
-                dim.clone(),
-                path.file_name().unwrap().to_string_lossy().to_string(),
-            ));
-        }
-    }
-    for (dim, file) in &wp_keys {
-        let find = |w: &World| {
-            w.waypoint_files
-                .iter()
-                .find(|(d, p)| d == dim && p.file_name().unwrap().to_string_lossy() == *file)
-                .map(|(_, p)| p.clone())
-        };
-        let pa = find(wa);
-        let pb = find(wb);
-        let merged = merge_waypoint_files(pa.as_deref(), pb.as_deref())?;
-        if let Some(text) = merged {
-            report.waypoint_files_merged += 1;
-            if opts.apply {
-                let to = out.join("minimap").join(&wb.id).join(dim).join(file);
-                std::fs::create_dir_all(to.parent().unwrap()).map_err(|e| e.to_string())?;
-                std::fs::write(&to, text).map_err(|e| e.to_string())?;
-            }
-        }
-    }
-    // Minimap config.txt: newer wins.
-    if let (Some(mma), Some(mmb)) = (&wa.minimap_path, &wb.minimap_path) {
-        let ca = mma.join("config.txt");
-        let cb = mmb.join("config.txt");
-        let newest = if mtime_of(&ca) >= mtime_of(&cb) {
-            &ca
-        } else {
-            &cb
-        };
-        if newest.is_file() {
-            report.aux_copied += 1;
-            if opts.apply {
-                copy_preserving_mtime(
-                    newest,
-                    &out.join("minimap").join(&wb.id).join("config.txt"),
-                )?;
-            }
-        }
-    } else if let Some(mm) = wa.minimap_path.as_ref().or(wb.minimap_path.as_ref()) {
-        let c = mm.join("config.txt");
-        if c.is_file() {
-            report.aux_copied += 1;
-            if opts.apply {
-                copy_preserving_mtime(&c, &out.join("minimap").join(&wb.id).join("config.txt"))?;
-            }
         }
     }
     Ok(())
@@ -618,6 +803,7 @@ fn merge_one_conflict(
     rz: i32,
     out_dir: &Path,
     prefer: Prefer,
+    resume: bool,
 ) -> Result<(), String> {
     let pa = idx_a.region_path(rx, rz).unwrap();
     let pb = idx_b.region_path(rx, rz).unwrap();
@@ -628,6 +814,12 @@ fn merge_one_conflict(
         Prefer::B => false,
         Prefer::Mtime => ma >= mb,
     };
+    let out_path = out_dir.join(format!("{rx}_{rz}.zip"));
+    // Conflict outputs are written to a temporary file and renamed, so one that
+    // is present is whole: decoding both sides again would be wasted work.
+    if resume && out_path.exists() {
+        return Ok(());
+    }
     let ctx = |p: &Path, e: String| format!("{}: {e}", p.display());
     let load = |p: &Path| -> Result<xaero_core::DecodedRegion, String> {
         let bytes = std::fs::read(p).map_err(|e| ctx(p, e.to_string()))?;
@@ -637,7 +829,6 @@ fn merge_one_conflict(
     };
     let da = load(&pa);
     let db = load(&pb);
-    let out_path = out_dir.join(format!("{rx}_{rz}.zip"));
     match (da, db) {
         (Ok(da), Ok(db)) => {
             let (primary, secondary) = if a_primary { (&da, &db) } else { (&db, &da) };
@@ -647,10 +838,21 @@ fn merge_one_conflict(
             xaero_core::decode_region(&stream).map_err(|e| format!("self-check {rx}_{rz}: {e}"))?;
             let container = xaero_core::write_region_container(&stream)
                 .map_err(|e| format!("zip {rx}_{rz}: {e}"))?;
+            // Written, fsynced, then renamed: a name that exists is a whole
+            // file even across a power cut, which is what `resume` relies on.
             let tmp = out_dir.join(format!("{rx}_{rz}.zip.tmp-xt"));
-            std::fs::write(&tmp, container).map_err(|e| e.to_string())?;
-            std::fs::rename(&tmp, &out_path).map_err(|e| e.to_string())?;
-            set_mtime_ms(&out_path, ma.max(mb));
+            let written = std::fs::File::create(&tmp)
+                .and_then(|mut f| {
+                    use std::io::Write;
+                    f.write_all(&container)?;
+                    f.sync_all()
+                })
+                .and_then(|_| std::fs::rename(&tmp, &out_path));
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("write {rx}_{rz}: {e}"));
+            }
+            set_mtime_ms(&out_path, ma.max(mb))?;
             Ok(())
         }
         // One side unreadable: keep the readable one rather than losing data.

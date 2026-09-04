@@ -338,9 +338,17 @@ fn read_pixel(
             px.biome = Some(BiomeRef::Palette(ctx.legacy_biome(id)));
         } else if params & P_BIOME_NEW != 0 {
             // A new palette entry, written either as a numeric id or as text.
+            // The game appends one entry per flagged pixel, whatever the id
+            // resolves to, so later indices only line up if we do the same:
+            // interning by name (as the palette-less majors above do) would
+            // shift every index after two ids that share a modern name.
             if params & P_BIOME_NUMERIC != 0 {
                 let id = rd.i32()?;
-                px.biome = Some(BiomeRef::Palette(ctx.legacy_biome(id)));
+                let name = legacy::biome_name(id);
+                px.biome = Some(BiomeRef::Palette(
+                    ctx.palettes
+                        .push_biome(name.as_bytes().to_vec(), name.to_string()),
+                ));
             } else {
                 let len = rd.u16()? as usize;
                 let raw = rd.take(len)?.to_vec();

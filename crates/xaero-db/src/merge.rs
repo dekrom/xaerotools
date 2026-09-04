@@ -14,7 +14,9 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::{highlight_semantics, quote_ident, HighlightSemantics};
+use crate::{
+    attach_uri, highlight_semantics, is_migration_leftover, quote_ident, HighlightSemantics,
+};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TableMergeReport {
@@ -43,6 +45,16 @@ fn canonical_table(name: &str) -> &str {
     }
 }
 
+/// The v0 table name a canonical dimension table had, if it had one.
+fn numeric_alias(canon: &str) -> Option<&'static str> {
+    match canon {
+        "minecraft:overworld" => Some("0"),
+        "minecraft:the_nether" => Some("-1"),
+        "minecraft:the_end" => Some("1"),
+        _ => None,
+    }
+}
+
 /// Brings a highlight DB (opened read-write) to schema v2 in place.
 /// Re-implements the semantics of XaeroPlus's V0ToV1Migration and
 /// V1ToV2Migration (rename numeric tables, rebuild as WITHOUT ROWID).
@@ -63,7 +75,9 @@ pub fn normalize_to_v2(conn: &Connection) -> Result<(), String> {
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
                 .map_err(e)?;
             for row in rows.flatten() {
-                tables.push(row);
+                if !is_migration_leftover(&row.0) {
+                    tables.push(row);
+                }
             }
         }
         let has_metadata = tables.iter().any(|(n, _)| n == "metadata");
@@ -106,7 +120,9 @@ pub fn normalize_to_v2(conn: &Connection) -> Result<(), String> {
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
                 .map_err(e)?;
             for row in rows.flatten() {
-                current.push(row);
+                if !is_migration_leftover(&row.0) {
+                    current.push(row);
+                }
             }
         }
         for (name, sql) in current {
@@ -121,8 +137,11 @@ pub fn normalize_to_v2(conn: &Connection) -> Result<(), String> {
             }
             let tmp = quote_ident(&format!("{name}_v2_migration"));
             let t = quote_ident(&name);
+            // A twin left by an interrupted game migration would make the
+            // CREATE fail and roll the whole normalization back.
             conn.execute_batch(&format!(
-                "CREATE TABLE {tmp} (x INTEGER, z INTEGER, foundTime INTEGER, \
+                "DROP TABLE IF EXISTS {tmp}; \
+                 CREATE TABLE {tmp} (x INTEGER, z INTEGER, foundTime INTEGER, \
                  PRIMARY KEY (x, z)) WITHOUT ROWID; \
                  INSERT OR IGNORE INTO {tmp} (x, z, foundTime) \
                  SELECT x, z, foundTime FROM {t}; \
@@ -189,8 +208,15 @@ pub fn merge_into_with(
     let e = |e: rusqlite::Error| e.to_string();
     // Dry-runs open the destination read-only so even pragmas can't touch it
     // (in dry-run the "destination" may be a source file used for counting).
+    // Apply mode opens without CREATE: a mistyped destination must fail, not
+    // become a fresh empty database that the sources then merge into.
     let conn = if apply {
-        Connection::open(dest)
+        Connection::open_with_flags(
+            dest,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
     } else {
         Connection::open_with_flags(
             dest,
@@ -218,10 +244,7 @@ pub fn merge_into_with(
     for (i, source) in sources.iter().enumerate() {
         let alias = format!("src{i}");
         // Read-only URI attach: sources are never written.
-        let uri = format!(
-            "file:{}?mode=ro",
-            source.display().to_string().replace('?', "%3F")
-        );
+        let uri = attach_uri(source);
         conn.execute(&format!("ATTACH DATABASE ?1 AS {alias}"), [&uri])
             .map_err(|er| format!("attach {}: {er}", source.display()))?;
 
@@ -236,6 +259,9 @@ pub fn merge_into_with(
                 .map_err(e)?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(e)?;
             for t in rows.flatten() {
+                if is_migration_leftover(&t) {
+                    continue;
+                }
                 let is_highlight = conn
                     .prepare(&format!(
                         "SELECT x, z, foundTime FROM {alias}.{} LIMIT 0",
@@ -263,13 +289,28 @@ pub fn merge_into_with(
                 ))
                 .map_err(e)?;
             }
-            let dest_exists: bool = conn
-                .query_row(
+            let table_exists = |name: &str| -> Result<bool, String> {
+                conn.query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
-                    [&canon],
+                    [name],
                     |r| r.get::<_, u64>(0).map(|n| n > 0),
                 )
-                .map_err(e)?;
+                .map_err(e)
+            };
+            // After normalization the canonical table is the only one there
+            // can be; a dry run against a v0 destination has to count the
+            // numeric-named table `--apply` would have renamed, or its report
+            // shows zero overlap where the real merge finds plenty.
+            let qdst = if table_exists(&canon)? {
+                qdst
+            } else if let Some(alias) = numeric_alias(&canon).filter(|_| !apply) {
+                quote_ident(alias)
+            } else {
+                qdst
+            };
+            let dest_exists = apply
+                || table_exists(&canon)?
+                || numeric_alias(&canon).is_some_and(|a| table_exists(a).unwrap_or(false));
             let (dest_rows_before, overlap): (u64, u64) = if dest_exists {
                 let before = conn
                     .query_row(&format!("SELECT COUNT(*) FROM {qdst}"), [], |r| r.get(0))
@@ -296,22 +337,41 @@ pub fn merge_into_with(
                 } else {
                     "MIN"
                 };
-                conn.execute_batch(&format!(
-                    "INSERT INTO {qdst} (x, z, foundTime) \
-                     SELECT x, z, foundTime FROM {qsrc} WHERE true \
-                     ON CONFLICT(x, z) DO UPDATE SET \
-                     foundTime = {keep}(foundTime, excluded.foundTime)"
-                ))
-                .map_err(e)?;
-                dest_rows_after = conn
-                    .query_row(&format!("SELECT COUNT(*) FROM {qdst}"), [], |r| r.get(0))
+                // One transaction per table: the invariant below is checked
+                // before anything is committed, so a failed merge leaves the
+                // destination as it was. COALESCE keeps a NULL on either side
+                // from erasing the real value (scalar MIN/MAX return NULL).
+                conn.execute_batch("BEGIN IMMEDIATE").map_err(e)?;
+                let merged = (|| -> Result<u64, String> {
+                    conn.execute_batch(&format!(
+                        "INSERT INTO {qdst} (x, z, foundTime) \
+                         SELECT x, z, foundTime FROM {qsrc} WHERE true \
+                         ON CONFLICT(x, z) DO UPDATE SET \
+                         foundTime = {keep}(COALESCE(foundTime, excluded.foundTime), \
+                                            COALESCE(excluded.foundTime, foundTime))"
+                    ))
                     .map_err(e)?;
-                let expected = dest_rows_before + source_rows - overlap;
-                if dest_rows_after != expected {
-                    return Err(format!(
-                        "post-merge invariant failed for {canon}: {dest_rows_after} rows, expected {expected}"
-                    ));
-                }
+                    let after: u64 = conn
+                        .query_row(&format!("SELECT COUNT(*) FROM {qdst}"), [], |r| r.get(0))
+                        .map_err(e)?;
+                    let expected = dest_rows_before + source_rows - overlap;
+                    if after != expected {
+                        return Err(format!(
+                            "post-merge invariant failed for {canon}: {after} rows, expected {expected}"
+                        ));
+                    }
+                    Ok(after)
+                })();
+                dest_rows_after = match merged {
+                    Ok(n) => {
+                        conn.execute_batch("COMMIT").map_err(e)?;
+                        n
+                    }
+                    Err(err) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(err);
+                    }
+                };
             }
             report.tables.push(TableMergeReport {
                 table: canon,
@@ -462,6 +522,94 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM \"0\"", [], |r| r.get(0))
             .unwrap();
         assert_eq!(s0n, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interrupted_game_migration_leftover_is_dropped_not_merged() {
+        let dir = std::env::temp_dir().join(format!("xt-dbleftover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("dest.db");
+        let src = dir.join("src.db");
+        mk_db(&dest, 1, &[("minecraft:overworld", 1, 1, 10)]);
+        // What XaeroPlus leaves behind when V1ToV2Migration dies mid-way: the
+        // twin table exists, the original is still a rowid table.
+        let c = Connection::open(&dest).unwrap();
+        c.execute_batch(
+            "CREATE TABLE \"minecraft:overworld_v2_migration\" (x INTEGER, z INTEGER, foundTime INTEGER, PRIMARY KEY (x,z)) WITHOUT ROWID;
+             INSERT INTO \"minecraft:overworld_v2_migration\" VALUES (9, 9, 9);",
+        )
+        .unwrap();
+        drop(c);
+        mk_db(&src, 2, &[("minecraft:overworld", 2, 2, 20)]);
+        let c = Connection::open(&src).unwrap();
+        c.execute_batch(
+            "CREATE TABLE \"minecraft:the_end_v2_migration\" (x INTEGER, z INTEGER, foundTime INTEGER);
+             INSERT INTO \"minecraft:the_end_v2_migration\" VALUES (8, 8, 8);",
+        )
+        .unwrap();
+        drop(c);
+
+        let report = merge_into(&dest, &[&src], true).unwrap();
+        assert!(
+            report
+                .tables
+                .iter()
+                .all(|t| !t.table.ends_with("_v2_migration")),
+            "leftover twins are never dimensions: {:?}",
+            report.tables
+        );
+        let conn = Connection::open(&dest).unwrap();
+        let leftovers: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%_v2_migration'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftovers, 0, "normalization dropped the leftover twin");
+        let n: u64 = conn
+            .query_row("SELECT COUNT(*) FROM \"minecraft:overworld\"", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 2, "rows of the leftover twin were not merged in");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dry_run_on_a_v0_destination_reports_what_apply_does() {
+        let dir = std::env::temp_dir().join(format!("xt-dbv0dry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("dest.db");
+        let src = dir.join("src.db");
+        mk_db(
+            &dest,
+            0,
+            &[
+                ("minecraft:overworld", 1, 1, 10),
+                ("minecraft:overworld", 2, 2, 10),
+            ],
+        );
+        mk_db(&src, 2, &[("minecraft:overworld", 1, 1, 5)]);
+        let dry = merge_into(&dest, &[&src], false).unwrap();
+        let applied = merge_into(&dest, &[&src], true).unwrap();
+        let pick = |r: &DbMergeReport| {
+            let t = r
+                .tables
+                .iter()
+                .find(|t| t.table == "minecraft:overworld")
+                .unwrap();
+            (t.dest_rows_before, t.overlap, t.dest_rows_after)
+        };
+        assert_eq!(pick(&dry), (2, 1, 2));
+        assert_eq!(pick(&dry), pick(&applied));
+        // A mistyped --apply destination must not be created on the fly.
+        let err = merge_into(&dir.join("nope.db"), &[&src], true).unwrap_err();
+        assert!(err.starts_with("open "), "{err}");
+        assert!(!dir.join("nope.db").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

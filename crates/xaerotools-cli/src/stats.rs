@@ -101,19 +101,18 @@ pub fn stats_cmd(args: &[String]) {
     while i < args.len() {
         match args[i].as_str() {
             "--root" => {
-                i += 1;
-                roots.push(PathBuf::from(&args[i]));
+                roots.push(PathBuf::from(crate::value(args, &mut i, "--root")));
             }
             "--world" => {
-                i += 1;
-                world = Some(args[i].clone());
+                world = Some(crate::value(args, &mut i, "--world"));
             }
             "--sample" => {
-                i += 1;
-                sample = args[i].parse().unwrap_or_else(|_| {
-                    eprintln!("--sample must be a number (0 skips the decode pass)");
-                    std::process::exit(2);
-                });
+                sample = crate::value(args, &mut i, "--sample")
+                    .parse()
+                    .unwrap_or_else(|_| {
+                        eprintln!("--sample must be a number (0 skips the decode pass)");
+                        std::process::exit(2);
+                    });
             }
             "--full" => full = true,
             "--no-dbs" => no_dbs = true,

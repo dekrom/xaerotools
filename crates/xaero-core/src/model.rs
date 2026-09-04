@@ -2,10 +2,13 @@
 //!
 //! Design principle: **passthrough-plus-fields**. Every pixel keeps its raw
 //! `params` word exactly as read; typed accessors decode the interesting bits.
-//! The encoder re-emits the passthrough bits verbatim and recomputes only the
-//! palette-dependent flags (pixel bits 21/22, overlay bit 10), which makes
-//! byte-identical re-encoding of major-7 input possible — our strongest
-//! regression oracle.
+//! The encoder rebuilds every field the modern loader derives from `params`
+//! (the state/overlay/biome/top-height flags, the 12-bit height, the palette
+//! first-appearance bits) from the typed fields and carries the rest over
+//! verbatim. For a major-7 input the rebuilt bits equal the ones read, which
+//! makes byte-identical re-encoding possible — our strongest regression
+//! oracle — while a pixel read under an older framing comes out framed for
+//! the current one.
 //!
 //! Palette entries are stored as the **raw bytes read from the file** (NBT for
 //! block states, Java-UTF payload for biomes) plus a decoded name for
@@ -56,6 +59,7 @@ pub struct Pixel {
     /// explicit unsigned byte.
     pub height: i16,
     /// Legacy raw height byte (params bit 6); never written by modern writers.
+    /// The encoder folds it into the packed height field.
     pub legacy_height: Option<u8>,
     /// Separate top height byte (params bit 24). The shipped writer truncates
     /// this to u8; we deliberately model it the same way.
@@ -78,10 +82,9 @@ impl Pixel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BiomeRef {
-    /// Index into `Palettes::biomes`.
+    /// Index into `Palettes::biomes`. Numeric biome ids from legacy files are
+    /// resolved to names and interned here too, so this is the only form.
     Palette(u32),
-    /// Legacy numeric biome id (params bit 23); passed through untouched.
-    LegacyNumeric(i32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

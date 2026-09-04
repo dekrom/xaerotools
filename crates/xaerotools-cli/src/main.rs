@@ -7,6 +7,7 @@
 
 mod archive;
 mod doctor;
+mod import_zvcr;
 mod render;
 mod stats;
 
@@ -25,6 +26,7 @@ fn main() {
         Some("doctor") => doctor::doctor_cmd(&args[1..]),
         Some("serve") => serve_cmd(&args[1..], false),
         Some("merge") => merge_cmd(&args[1..]),
+        Some("import-zvcr") => import_zvcr::import_zvcr_cmd(&args[1..]),
         Some("db-merge") => db_merge_cmd(&args[1..]),
         Some("waypoints") => waypoints_cmd(&args[1..]),
         Some("tokens") => tokens_cmd(&args[1..]),
@@ -33,6 +35,7 @@ fn main() {
         // Bare invocation is the double-click path: open the browser for the
         // user, they were never going to read a listening-on line.
         None => serve_cmd(&[], true),
+        Some("help" | "--help" | "-h") => print_help(),
         _ => {
             print_help();
             std::process::exit(2);
@@ -50,6 +53,7 @@ fn print_help() {
     eprintln!("  xaerotools serve [--root PATH]... [--port N] [--open]");
     eprintln!("                   [--lan --password PW] [--vault PATH] [--atlas-dir PATH]");
     eprintln!("                   [--config PATH] [--ingest-dir PATH] [--ingest-no-caves]");
+    eprintln!("                   [--ingest-require-token]");
     eprintln!("                   [--live-poll]");
     eprintln!("  xaerotools render --bbox x1,z1,x2,z2 | --all  -o out.png");
     eprintln!("                   [--root PATH]... [--world W] [--dim D] [--mw MW]");
@@ -58,9 +62,12 @@ fn print_help() {
     eprintln!("  xaerotools stats  [--root PATH]... [--world W] [--sample N | --full]");
     eprintln!("                   [--no-dbs] [--json]");
     eprintln!("  xaerotools doctor [--root PATH]... [--world W] [--sample N | --full] [--json]");
-    eprintln!("  xaerotools merge <A> <B> -o OUT [--apply] [--prefer mtime|a|b]");
+    eprintln!("  xaerotools merge <A> <B> -o OUT [--apply] [--prefer mtime|a|b] [--resume]");
     eprintln!("                   [--server NAME]... [--alias X=Y]... [--yes] [--json]");
     eprintln!("  xaerotools db-merge <BASE.db> <SRC.db>... [-o OUT.db] [--apply] [--json]");
+    eprintln!("  xaerotools import-zvcr --src DIR... -o OUT_ROOT [--world W] [--mw MW]");
+    eprintln!("                   [--threads N] [--limit N] [--overwrite] [--dry-run]");
+    eprintln!("                   [--no-nether-roof-removal]");
     eprintln!("  xaerotools waypoints sync   [--root PATH]... [--vault PATH]");
     eprintln!("  xaerotools waypoints list   [--world W] [--archived-only] [--vault PATH]");
     eprintln!("  xaerotools waypoints export --world W -o DIR [--include-archived] [--vault PATH]");
@@ -95,8 +102,7 @@ fn tokens_cmd(args: &[String]) {
     while i < rest.len() {
         match rest[i].as_str() {
             "--config" => {
-                i += 1;
-                config_path = Some(PathBuf::from(&rest[i]));
+                config_path = Some(PathBuf::from(value(rest, &mut i, "--config")));
             }
             other if !other.starts_with('-') => names.push(other.to_string()),
             other => {
@@ -206,20 +212,16 @@ fn waypoints_cmd(args: &[String]) {
     while i < rest.len() {
         match rest[i].as_str() {
             "--root" => {
-                i += 1;
-                roots.push(PathBuf::from(&rest[i]));
+                roots.push(PathBuf::from(value(rest, &mut i, "--root")));
             }
             "--vault" => {
-                i += 1;
-                vault_path = Some(PathBuf::from(&rest[i]));
+                vault_path = Some(PathBuf::from(value(rest, &mut i, "--vault")));
             }
             "--world" => {
-                i += 1;
-                world = Some(rest[i].clone());
+                world = Some(value(rest, &mut i, "--world"));
             }
             "-o" => {
-                i += 1;
-                out = Some(PathBuf::from(&rest[i]));
+                out = Some(PathBuf::from(value(rest, &mut i, "-o")));
             }
             "--archived-only" => archived_only = true,
             "--include-archived" => include_archived = true,
@@ -352,29 +354,28 @@ fn merge_cmd(args: &[String]) {
     while i < args.len() {
         match args[i].as_str() {
             "-o" => {
-                i += 1;
-                out = Some(PathBuf::from(&args[i]));
+                out = Some(PathBuf::from(value(args, &mut i, "-o")));
             }
             "--apply" => opts.apply = true,
+            "--resume" => opts.resume = true,
             "--yes" => opts.auto_alias = true,
             "--json" => json = true,
             "--server" => {
-                i += 1;
-                opts.servers.push(args[i].clone());
+                opts.servers.push(value(args, &mut i, "--server"));
             }
             "--alias" => {
-                i += 1;
-                let (x, y) = args[i]
-                    .split_once('=')
-                    .unwrap_or_else(|| panic!("--alias must be A-id=B-id"));
+                let alias = value(args, &mut i, "--alias");
+                let Some((x, y)) = alias.split_once('=') else {
+                    die(2, "--alias must be A-id=B-id");
+                };
                 opts.aliases.push((x.to_string(), y.to_string()));
             }
             "--prefer" => {
-                i += 1;
-                opts.prefer = match args[i].as_str() {
+                opts.prefer = match value(args, &mut i, "--prefer").as_str() {
                     "a" => xaero_merge::Prefer::A,
                     "b" => xaero_merge::Prefer::B,
-                    _ => xaero_merge::Prefer::Mtime,
+                    "mtime" => xaero_merge::Prefer::Mtime,
+                    other => die(2, &format!("--prefer must be mtime, a or b (got {other})")),
                 };
             }
             other if !other.starts_with('-') => positional.push(PathBuf::from(other)),
@@ -393,15 +394,8 @@ fn merge_cmd(args: &[String]) {
         eprintln!("merge needs -o OUT (a fresh output directory)");
         std::process::exit(2);
     });
-    if out.exists()
-        && out
-            .read_dir()
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(true)
-    {
-        eprintln!("output {} already exists and is not empty", out.display());
-        std::process::exit(1);
-    }
+    // The output guard (empty unless --resume, never inside a source) lives in
+    // merge_to_output, so the web UI's merge tool is held to the same rule.
     let report = match xaero_merge::merge_to_output(&positional[0], &positional[1], &out, &opts) {
         Ok(r) => r,
         Err(e) => {
@@ -411,9 +405,18 @@ fn merge_cmd(args: &[String]) {
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
-        return;
+    } else {
+        print_merge_report(&report, &out);
     }
-    print_merge_report(&report, &out);
+    // A region that could not be merged is missing from OUT; that is not a
+    // successful run, however much else was written.
+    let failed: usize = report.units.iter().map(|u| u.merge_errors.len()).sum();
+    if failed > 0 {
+        eprintln!(
+            "{failed} region(s) could not be merged — see the ! lines above; OUT is incomplete"
+        );
+        std::process::exit(1);
+    }
 }
 
 fn print_merge_report(r: &xaero_merge::MergeReport, out: &std::path::Path) {
@@ -429,6 +432,9 @@ fn print_merge_report(r: &xaero_merge::MergeReport, out: &std::path::Path) {
     }
     for w in &r.only_worlds {
         println!("copying whole world: {w}");
+    }
+    for w in &r.warnings {
+        println!("warning: {w}");
     }
     println!();
     println!(
@@ -492,8 +498,7 @@ fn db_merge_cmd(args: &[String]) {
     while i < args.len() {
         match args[i].as_str() {
             "-o" => {
-                i += 1;
-                out = Some(PathBuf::from(&args[i]));
+                out = Some(PathBuf::from(value(args, &mut i, "-o")));
             }
             "--apply" => apply = true,
             "--json" => json = true,
@@ -533,7 +538,25 @@ fn db_merge_cmd(args: &[String]) {
         );
     }
     let sources: Vec<&std::path::Path> = positional[1..].iter().map(|p| p.as_path()).collect();
-    match xaero_db::merge::merge_into(&dest, &sources, apply) {
+    // Drawing DBs have their own schema; the highlight merger's v2
+    // normalisation fails on them and leaves OUT a plain copy of BASE.
+    let is_drawing = [&base, &dest].iter().any(|p| {
+        p.file_name()
+            .is_some_and(|n| xaero_db::drawing::is_drawing_db(&n.to_string_lossy()))
+    });
+    let merged = if is_drawing {
+        xaero_db::drawing::merge_into(&dest, &sources, apply).map(|dr| {
+            xaero_db::merge::DbMergeReport {
+                dest: dr.dest,
+                sources: dr.sources,
+                tables: dr.tables,
+                applied: dr.applied,
+            }
+        })
+    } else {
+        xaero_db::merge::merge_into(&dest, &sources, apply)
+    };
+    match merged {
         Ok(report) => {
             if json {
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -567,38 +590,38 @@ fn serve_cmd(args: &[String], open_default: bool) {
     while i < args.len() {
         match args[i].as_str() {
             "--root" => {
-                i += 1;
-                config.roots.push(PathBuf::from(&args[i]));
+                config
+                    .roots
+                    .push(PathBuf::from(value(args, &mut i, "--root")));
             }
             "--port" => {
-                i += 1;
-                port = match args[i].parse() {
+                port = match value(args, &mut i, "--port").parse() {
+                    Ok(0) => die(
+                        2,
+                        "--port 0 would pick a random port nobody can be told about",
+                    ),
                     Ok(p) => p,
                     Err(_) => die(2, "--port must be a number"),
                 };
             }
             "--lan" => lan = true,
             "--password" => {
-                i += 1;
-                config.password = Some(args[i].clone());
+                config.password = Some(value(args, &mut i, "--password"));
             }
             "--vault" => {
-                i += 1;
-                config.vault_path = Some(PathBuf::from(&args[i]));
+                config.vault_path = Some(PathBuf::from(value(args, &mut i, "--vault")));
             }
             "--atlas-dir" => {
-                i += 1;
-                config.atlas_dir = Some(PathBuf::from(&args[i]));
+                config.atlas_dir = Some(PathBuf::from(value(args, &mut i, "--atlas-dir")));
             }
             "--config" => {
-                i += 1;
-                config.config_path = Some(PathBuf::from(&args[i]));
+                config.config_path = Some(PathBuf::from(value(args, &mut i, "--config")));
             }
             "--ingest-dir" => {
-                i += 1;
-                config.ingest_dir = Some(PathBuf::from(&args[i]));
+                config.ingest_dir = Some(PathBuf::from(value(args, &mut i, "--ingest-dir")));
             }
             "--ingest-no-caves" => config.ingest_no_caves = true,
+            "--ingest-require-token" => config.ingest_require_token = true,
             "--live-poll" => config.live_poll = true,
             "--open" => open = true,
             other => {
@@ -715,6 +738,16 @@ fn open_browser(url: &str) {
     }
 }
 
+/// The value after a flag, or a usage error when the flag is the last word on
+/// the line (`serve --root`) — never an index panic with a backtrace.
+pub(crate) fn value(args: &[String], i: &mut usize, flag: &str) -> String {
+    *i += 1;
+    match args.get(*i) {
+        Some(v) => v.clone(),
+        None => die(2, &format!("{flag} needs a value (see xaerotools help)")),
+    }
+}
+
 /// Print the error and exit — but on a Windows double-click, hold the console
 /// first: exiting straight away closes the window before the message can be
 /// read, which reads as "the program does nothing".
@@ -756,8 +789,7 @@ fn render_region_cmd(args: &[String]) {
     while i < args.len() {
         match args[i].as_str() {
             "-o" => {
-                i += 1;
-                output = PathBuf::from(&args[i]);
+                output = PathBuf::from(value(args, &mut i, "-o"));
             }
             "--cave" => opts.cave_override = Some(i32::MIN),
             "--roof" => opts.roof = Some(ROOF_DEFAULT),

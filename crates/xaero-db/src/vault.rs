@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use xaero_core::waypoints::Waypoint;
 
 pub struct Vault {
@@ -57,6 +57,14 @@ pub struct VaultWaypoint {
     pub color: u8,
     pub purpose: i32,
     pub set: String,
+    pub disabled: bool,
+    #[serde(rename = "rotateOnTp")]
+    pub rotate_on_tp: bool,
+    #[serde(rename = "tpYaw")]
+    pub tp_yaw: i32,
+    #[serde(rename = "visibilityType")]
+    pub visibility_type: i32,
+    pub destination: bool,
     pub present: bool,
     #[serde(rename = "firstSeen")]
     pub first_seen: i64,
@@ -120,7 +128,14 @@ impl Vault {
     /// Groups not scanned this run are left untouched.
     pub fn sync(&mut self, batches: &[VaultBatch], now_ms: i64) -> Result<VaultSyncReport, String> {
         let e = |e: rusqlite::Error| e.to_string();
-        let tx = self.conn.transaction().map_err(e)?;
+        // IMMEDIATE: a deferred transaction that starts with the SELECT
+        // below and then writes fails with SQLITE_BUSY_SNAPSHOT (no busy
+        // handler retry) when another sync committed in between — the CLI
+        // and a starting server can race on the same vault.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(e)?;
         let mut report = VaultSyncReport::default();
         let counts = |tx: &rusqlite::Transaction| -> Result<(i64, i64), String> {
             tx.query_row(
@@ -228,7 +243,8 @@ impl Vault {
     ) -> Result<Vec<VaultWaypoint>, String> {
         let sql = format!(
             "SELECT world, dim, mw_file, name, initials, x, y, z, color, purpose, wp_set,
-                    present, first_seen, last_seen, source
+                    present, first_seen, last_seen, source,
+                    disabled, rotate_on_tp, tp_yaw, visibility_type, destination
              FROM waypoints WHERE world = ?1 {} ORDER BY dim, name",
             if archived_only { "AND present = 0" } else { "" }
         );
@@ -251,6 +267,11 @@ impl Vault {
                     first_seen: r.get(12)?,
                     last_seen: r.get(13)?,
                     source: r.get(14)?,
+                    disabled: r.get::<_, i64>(15)? != 0,
+                    rotate_on_tp: r.get::<_, i64>(16)? != 0,
+                    tp_yaw: r.get::<_, i64>(17)? as i32,
+                    visibility_type: r.get::<_, i64>(18)? as i32,
+                    destination: r.get::<_, i64>(19)? != 0,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -305,13 +326,13 @@ impl Vault {
                 y: wp.y,
                 z: wp.z,
                 color: wp.color,
-                disabled: false,
+                disabled: wp.disabled,
                 purpose: wp.purpose,
                 set: wp.set,
-                rotate_on_tp: false,
-                tp_yaw: 0,
-                visibility_type: 0,
-                destination: false,
+                rotate_on_tp: wp.rotate_on_tp,
+                tp_yaw: wp.tp_yaw,
+                visibility_type: wp.visibility_type,
+                destination: wp.destination,
             };
             out.push_str(&xaero_core::waypoints::format_waypoint_line(&w));
             out.push('\n');
@@ -363,6 +384,41 @@ mod tests {
             source: src.into(),
             waypoints: wps,
         }
+    }
+
+    #[test]
+    fn export_keeps_the_flags_the_game_wrote() {
+        let dir = std::env::temp_dir().join(format!("xt-vault-flags-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut v = Vault::open(&dir.join("vault.db")).unwrap();
+        let mut off = wp("off", 1, 2);
+        off.disabled = true;
+        off.rotate_on_tp = true;
+        off.tp_yaw = 90;
+        off.visibility_type = 2;
+        off.destination = true;
+        v.sync(
+            &[batch("Multiplayer_2b2t", "acct-A", vec![off.clone()])],
+            1000,
+        )
+        .unwrap();
+        let rows = v.waypoints_for_world("Multiplayer_2b2t", false).unwrap();
+        assert!(rows[0].disabled && rows[0].rotate_on_tp && rows[0].destination);
+        assert_eq!((rows[0].tp_yaw, rows[0].visibility_type), (90, 2));
+        let text = v
+            .export_file(
+                "Multiplayer_2b2t",
+                "minecraft:the_nether",
+                "mw$default_1.txt",
+                true,
+            )
+            .unwrap();
+        let expected = xaero_core::waypoints::format_waypoint_line(&off);
+        assert!(
+            text.lines().any(|l| l == expected),
+            "restored line must carry disabled/rotate/yaw/visibility/destination:\n{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

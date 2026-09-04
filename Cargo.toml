@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/xaero-core", "crates/xaero-db", "crates/xaero-merge", "crates/xaero-scan", "crates/xaerotools-server", "crates/xaerotools-cli", "tools/xaero-colorgen"]
+members = ["crates/xaero-core", "crates/xaero-db", "crates/xaero-merge", "crates/xaero-scan", "crates/xaero-zvcr", "crates/xaerotools-server", "crates/xaerotools-cli", "tools/xaero-colorgen"]
 
 [workspace.package]
 version = "0.4.0"

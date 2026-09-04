@@ -19,8 +19,11 @@
 //! ever writes inside the ingest dir — scanned user roots stay read-only.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -28,7 +31,7 @@ use axum::response::{IntoResponse, Response};
 use xaero_core::naming::is_multiworld_folder;
 
 use crate::live::{bucket_allow, Bucket};
-use crate::{now_ms, AppState, WorldEntry};
+use crate::{lock_ok, now_ms, AppState, WorldEntry};
 
 /// Body cap for one region upload. Real 2b2t regions run a few hundred KB to a
 /// few MB; anything near this is not a region file.
@@ -39,6 +42,12 @@ const RATE_PER_SEC: f64 = 10.0;
 const RATE_BURST: f64 = 20.0;
 /// |rx|/|rz| cap — the world border (|x| <= 40M blocks) is region 78,125.
 const COORD_CAP: i32 = 100_000;
+/// Upload-driven rescans are held back until this long after the previous one,
+/// so a burst of first-of-a-kind uploads (a full `.xt sync` of a many-world
+/// instance) shares one rescan instead of clearing every viewer per world.
+const RESCAN_COALESCE: Duration = Duration::from_secs(2);
+/// Makes temp names unique per call, on top of the pid.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct IngestState {
     /// Rate buckets keyed by *validated* player name.
@@ -53,6 +62,8 @@ pub(crate) struct IngestState {
     /// Serializes "new layer appeared" rescans so an upload burst triggers one
     /// rescan, not one per request.
     pub(crate) rescan_gate: tokio::sync::Mutex<()>,
+    /// When an upload last forced a rescan (see `RESCAN_COALESCE`).
+    last_rescan: Mutex<Option<Instant>>,
 }
 
 impl IngestState {
@@ -62,8 +73,29 @@ impl IngestState {
             hl_rate: Mutex::new(HashMap::new()),
             write_lock: Mutex::new(()),
             rescan_gate: tokio::sync::Mutex::new(()),
+            last_rescan: Mutex::new(None),
         }
     }
+}
+
+/// Rescans the roots for an upload that named a layer or database the world
+/// list does not carry yet. Serialized behind the gate, re-checked under it,
+/// and held back until `RESCAN_COALESCE` has passed since the previous
+/// upload-driven rescan, so a burst of such uploads shares one rescan: the
+/// requests queued behind it find `still_needed` false and skip. Returns
+/// whether a rescan ran.
+pub(crate) async fn rescan_for_upload(st: &Arc<AppState>, still_needed: impl Fn() -> bool) -> bool {
+    let _gate = st.ingest.rescan_gate.lock().await;
+    let last = *lock_ok(&st.ingest.last_rescan);
+    if let Some(wait) = last.and_then(|t| RESCAN_COALESCE.checked_sub(t.elapsed())) {
+        tokio::time::sleep(wait).await;
+    }
+    if !still_needed() {
+        return false;
+    }
+    crate::rescan_roots(st).await;
+    *lock_ok(&st.ingest.last_rescan) = Some(Instant::now());
+    true
 }
 
 /// The ingest-managed directories that should be served as map roots: one per
@@ -137,38 +169,96 @@ fn layer_rel(q: &RegionQuery) -> PathBuf {
     }
 }
 
-fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+/// Writes `name` through a temp file that is fsynced, stamped and renamed into
+/// place. The temp name is unique per process and call, so two uploads of one
+/// coordinate can never rename each other's half-written bytes; the fsync
+/// means a crash leaves either the old file or the complete new one. The mtime
+/// goes on the temp file and travels with the rename, so a failed stamp leaves
+/// no wrongly-dated region behind.
+fn write_atomic(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    mtime_ms: Option<u64>,
+) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-    let tmp = dir.join(format!("{name}.tmp-xt"));
+    let tmp = dir.join(format!(
+        "{name}.tmp-xt-{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let dst = dir.join(name);
-    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &dst).map_err(|e| format!("rename {}: {e}", dst.display()))?;
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        if let Some(ms) = mtime_ms {
+            filetime::set_file_mtime(&tmp, file_time(ms))?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("write {}: {e}", tmp.display()));
+    }
+    std::fs::rename(&tmp, &dst).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename {}: {e}", dst.display())
+    })?;
     Ok(dst)
+}
+
+fn file_time(ms: u64) -> filetime::FileTime {
+    filetime::FileTime::from_unix_time((ms / 1000) as i64, ((ms % 1000) * 1_000_000) as u32)
 }
 
 /// Writes region bytes as `<rx>_<rz>.<ext>` (ext from the container magic) and
 /// drops any stale opposite-extension file so one coordinate is one file.
-fn write_region_file(dir: &Path, rx: i32, rz: i32, bytes: &[u8]) -> Result<(), String> {
+fn write_region_file(
+    dir: &Path,
+    rx: i32,
+    rz: i32,
+    bytes: &[u8],
+    mtime_ms: Option<u64>,
+) -> Result<(), String> {
     let is_zip = bytes.starts_with(b"PK");
     let (ext, other) = if is_zip {
         ("zip", "xaero")
     } else {
         ("xaero", "zip")
     };
-    write_atomic(dir, &format!("{rx}_{rz}.{ext}"), bytes)?;
+    write_atomic(dir, &format!("{rx}_{rz}.{ext}"), bytes, mtime_ms)?;
     let _ = std::fs::remove_file(dir.join(format!("{rx}_{rz}.{other}")));
     Ok(())
 }
 
+/// The observation time an upload claims for its region (`X-XT-Mtime`, unix
+/// ms — the client's file mtime), clamped to now so a client clock in the
+/// future cannot make its tiles beat every later upload; absent or unparsable
+/// means now.
+fn upload_mtime(headers: &HeaderMap) -> u64 {
+    let now = now_ms();
+    headers
+        .get("x-xt-mtime")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map_or(now, |ms| ms.min(now))
+}
+
 /// The whole blocking side of one upload: decode-validate, back up verbatim,
-/// merge into the shared tree. Factored off the handler so tests can drive it
-/// without HTTP.
+/// merge into the shared tree. `mtime_ms` is when the client's game wrote the
+/// file — it becomes the backup's mtime and decides which side's tiles win in
+/// the merged tree. Factored off the handler so tests can drive it without
+/// HTTP.
 pub(crate) fn store_upload(
     ingest_dir: &Path,
     write_lock: &Mutex<()>,
     player: &str,
     q: &RegionQuery,
     bytes: &[u8],
+    mtime_ms: u64,
 ) -> Result<(), (StatusCode, String)> {
     let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string());
     let stream = xaero_core::read_region_container(bytes)
@@ -182,16 +272,24 @@ pub(crate) fn store_upload(
     }
 
     let rel = layer_rel(q);
+    // One upload at a time across both trees: two uploads of one coordinate
+    // must not interleave in the backup any more than in the merged
+    // read-modify-write. A poisoned lock is taken back rather than turning
+    // every later upload into a 500.
+    let _guard = lock_ok(write_lock);
     let backup_dir = ingest_dir.join("players").join(player).join(&rel);
-    write_region_file(&backup_dir, q.rx, q.rz, bytes)
+    write_region_file(&backup_dir, q.rx, q.rz, bytes, Some(mtime_ms))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let merged_dir = ingest_dir.join("merged").join(&rel);
-    let _guard = write_lock.lock().unwrap();
     let existing = ["zip", "xaero"]
         .iter()
         .map(|ext| merged_dir.join(format!("{}_{}.{ext}", q.rx, q.rz)))
         .find(|p| p.is_file());
+    let existing_mtime = existing
+        .as_ref()
+        .map(|p| crate::config::mtime_ms(p))
+        .unwrap_or(0);
     let merged_from_existing = existing.and_then(|path| {
         // An unreadable merged file (torn write from a crash) must not wedge
         // the coordinate forever: fall through to a fresh verbatim copy.
@@ -210,12 +308,20 @@ pub(crate) fn store_upload(
         }
     });
     match merged_from_existing {
-        None => write_region_file(&merged_dir, q.rx, q.rz, bytes)
+        None => write_region_file(&merged_dir, q.rx, q.rz, bytes, Some(mtime_ms))
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
         Some(old) => {
-            // Incoming tiles are the newest observation, so they win; tiles the
-            // upload lacks survive from what was already merged.
-            let merged = xaero_core::merge::merge_regions(&incoming, &old);
+            // Tiles from the newer observation win, whichever side that is: a
+            // client syncing a months-old map must not overwrite what a fresher
+            // upload already put here. Tiles only one side has survive, and the
+            // merged file carries the newer of the two times — the folder
+            // merger weighs conflicts by mtime, so it must never look newer
+            // than what it holds.
+            let merged = if existing_mtime > mtime_ms {
+                xaero_core::merge::merge_regions(&old, &incoming)
+            } else {
+                xaero_core::merge::merge_regions(&incoming, &old)
+            };
             let stream = xaero_core::encode_region(&merged);
             xaero_core::decode_region(&stream).map_err(|e| {
                 (
@@ -225,8 +331,14 @@ pub(crate) fn store_upload(
             })?;
             let container = xaero_core::write_region_container(&stream)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("zip: {e}")))?;
-            write_region_file(&merged_dir, q.rx, q.rz, &container)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            write_region_file(
+                &merged_dir,
+                q.rx,
+                q.rz,
+                &container,
+                Some(existing_mtime.max(mtime_ms)),
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
         }
     }
     Ok(())
@@ -265,13 +377,16 @@ pub(crate) async fn ingest_region(
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Query(q): Query<RegionQuery>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    req: axum::extract::Request,
 ) -> Response {
+    // Everything that can reject runs before the body is read: a peer with no
+    // token, a bad name or an exhausted bucket never gets to park 32 MiB in
+    // memory first.
     // Tokenless loopback clients name themselves here; ignored when a valid
     // token names the player (the token is the stronger claim).
     let declared = headers.get("x-xt-player").and_then(|v| v.to_str().ok());
     let player = match crate::live::ingest_player(&st, &headers, peer, declared).await {
-        Ok(p) => p,
+        Ok(a) => a.player,
         Err(resp) => return resp,
     };
     if !safe_segment(&player) {
@@ -293,14 +408,8 @@ pub(crate) async fn ingest_region(
         )
             .into_response();
     }
-    if body.is_empty() {
-        return (StatusCode::BAD_REQUEST, "empty body").into_response();
-    }
-    if body.len() > REGION_BODY_MAX {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "region too large").into_response();
-    }
     {
-        let mut rate = st.ingest.rate.lock().unwrap();
+        let mut rate = lock_ok(&st.ingest.rate);
         let bucket = rate
             .entry(player.clone())
             .or_insert_with(|| Bucket::new(RATE_BURST, now_ms()));
@@ -308,18 +417,36 @@ pub(crate) async fn ingest_region(
             return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
         }
     }
+    let body = match axum::body::to_bytes(req.into_body(), REGION_BODY_MAX).await {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "region too large").into_response(),
+    };
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty body").into_response();
+    }
+    let mtime_ms = upload_mtime(&headers);
 
     let known_before = layer_known(&st.worlds.read().unwrap().clone(), &st, &player, &q);
     let st2 = st.clone();
     let player2 = player.clone();
     let stored = tokio::task::spawn_blocking(move || {
-        let out = store_upload(&st2.ingest_dir, &st2.ingest.write_lock, &player2, &q, &body);
+        let out = store_upload(
+            &st2.ingest_dir,
+            &st2.ingest.write_lock,
+            &player2,
+            &q,
+            &body,
+            mtime_ms,
+        );
         (out, q)
     })
     .await;
     let (stored, q) = match stored {
         Ok(v) => v,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "store task failed").into_response(),
+        Err(e) => {
+            eprintln!("ingest: store task failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "store task failed").into_response();
+        }
     };
     if let Err((code, msg)) = stored {
         return (code, msg).into_response();
@@ -370,12 +497,12 @@ pub(crate) async fn ingest_region(
 
     if !known_before {
         // First region of a new world/dim/mw (or a brand-new player root): the
-        // world list has to grow and the watcher re-arm. Serialized so a burst
+        // world list has to grow and the watcher re-arm. Coalesced so a burst
         // of such uploads costs one rescan.
-        let _gate = st.ingest.rescan_gate.lock().await;
-        if !layer_known(&st.worlds.read().unwrap().clone(), &st, &player, &q) {
-            crate::rescan_roots(&st).await;
-        }
+        rescan_for_upload(&st, || {
+            !layer_known(&st.worlds.read().unwrap().clone(), &st, &player, &q)
+        })
+        .await;
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -428,6 +555,11 @@ mod tests {
         );
     }
 
+    /// Two observation times a day apart, well in the past so the clamp to
+    /// now never bites.
+    const T1: u64 = 1_700_000_000_000;
+    const T2: u64 = T1 + 86_400_000;
+
     fn corpus_root() -> Option<PathBuf> {
         if let Ok(p) = std::env::var("XAERO_CORPUS") {
             let p = PathBuf::from(p);
@@ -460,7 +592,7 @@ mod tests {
         req.rx = 0;
         req.rz = -559;
 
-        store_upload(&dir, &lock, "Alice", &req, &a).unwrap();
+        store_upload(&dir, &lock, "Alice", &req, &a, T1).unwrap();
         let backup =
             dir.join("players/Alice/world-map/Multiplayer_2b2t/DIM-1/mw$default/0_-559.zip");
         assert_eq!(std::fs::read(&backup).unwrap(), a, "backup is verbatim");
@@ -472,7 +604,7 @@ mod tests {
         );
 
         // A second client uploads its own copy: backup separate, merged re-encoded.
-        store_upload(&dir, &lock, "Bob", &req, &b).unwrap();
+        store_upload(&dir, &lock, "Bob", &req, &b, T2).unwrap();
         let bob = dir.join("players/Bob/world-map/Multiplayer_2b2t/DIM-1/mw$default/0_-559.zip");
         assert_eq!(std::fs::read(&bob).unwrap(), b);
         assert_eq!(
@@ -492,12 +624,97 @@ mod tests {
         let mut junk = q("Multiplayer_2b2t", "DIM-1", "mw$default");
         junk.rx = 9;
         junk.rz = 9;
-        assert!(store_upload(&dir, &lock, "Alice", &junk, b"not a region").is_err());
+        assert!(store_upload(&dir, &lock, "Alice", &junk, b"not a region", T2).is_err());
         assert!(!dir
             .join("players/Alice/world-map/Multiplayer_2b2t/DIM-1/mw$default/9_9.zip")
             .exists());
 
         assert_eq!(ingest_roots(&dir).len(), 3, "Alice, Bob, merged");
+        assert_eq!(
+            crate::config::mtime_ms(&backup),
+            T1,
+            "backup keeps the client's mtime"
+        );
+        assert_eq!(
+            crate::config::mtime_ms(&merged),
+            T2,
+            "merged carries the newer time"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The newer observation wins whichever order the uploads arrive in: a
+    /// months-old sync must not overwrite tiles a fresher upload already put
+    /// in the merged tree, and the merged file's mtime is the newer of the two.
+    #[test]
+    fn older_upload_does_not_overwrite_newer_merged_tiles() {
+        let Some(root) = corpus_root() else {
+            eprintln!("corpus not found; skipping");
+            return;
+        };
+        // The first same-name pair whose two copies really differ where they
+        // overlap — a pair whose merge is the same either way proves nothing.
+        let dir_a = root.join("xaero1.21.4/world-map/Multiplayer_2b2t/DIM-1/mw$default");
+        let dir_b = root.join("xaero1.21.8/world-map/Multiplayer_2b2t/DIM-1/mw$default");
+        let dec = |bytes: &[u8]| {
+            xaero_core::read_region_container(bytes)
+                .and_then(|s| xaero_core::decode_region(&s))
+                .unwrap()
+        };
+        let mut names: Vec<String> = std::fs::read_dir(&dir_a)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".zip") && dir_b.join(n).is_file())
+            .collect();
+        names.sort();
+        let mut pick = None;
+        for name in names {
+            let (a, b) = (
+                std::fs::read(dir_a.join(&name)).unwrap(),
+                std::fs::read(dir_b.join(&name)).unwrap(),
+            );
+            let (da, db) = (dec(&a), dec(&b));
+            let newer_wins = xaero_core::encode_region(&xaero_core::merge::merge_regions(&db, &da));
+            let older_wins = xaero_core::encode_region(&xaero_core::merge::merge_regions(&da, &db));
+            if newer_wins != older_wins {
+                pick = Some((name, a, b, newer_wins));
+                break;
+            }
+        }
+        let Some((name, a, b, expected)) = pick else {
+            eprintln!("no conflicting corpus pair; skipping");
+            return;
+        };
+        let (rx, rz, _) = xaero_core::naming::parse_region_filename(&name).unwrap();
+
+        let mut req = q("Multiplayer_2b2t", "DIM-1", "mw$default");
+        req.rx = rx;
+        req.rz = rz;
+        let lock = Mutex::new(());
+        let merged_rel = format!("merged/world-map/Multiplayer_2b2t/DIM-1/mw$default/{name}");
+        for (label, first, second) in [
+            ("newer first", (&b, T2), (&a, T1)),
+            ("older first", (&a, T1), (&b, T2)),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "xt-ingest-order-{}-{}",
+                std::process::id(),
+                label.replace(' ', "-")
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            store_upload(&dir, &lock, "P", &req, first.0, first.1).unwrap();
+            store_upload(&dir, &lock, "Q", &req, second.0, second.1).unwrap();
+            let merged = dir.join(&merged_rel);
+            let stream =
+                xaero_core::read_region_container(&std::fs::read(&merged).unwrap()).unwrap();
+            assert_eq!(stream, expected, "{label}: newer tiles must win");
+            assert_eq!(
+                crate::config::mtime_ms(&merged),
+                T2,
+                "{label}: merged mtime"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

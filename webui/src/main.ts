@@ -132,6 +132,13 @@ function hlLabel(db: string): string {
   return db.replace(/^XaeroPlus/, '').replace(/\.db$/, '');
 }
 
+/** The name a DB travels under in the hash: the short label for the mod's
+ *  own `XaeroPlus*.db` files, the full name for anything else, so readHash
+ *  (which re-adds the prefix only to names without `.db`) round-trips both. */
+function hlHashName(db: string): string {
+  return /^XaeroPlus.*\.db$/.test(db) ? hlLabel(db) : db;
+}
+
 const HL_OPACITY_DEFAULT = 0.85;
 /** Per-DB colour overrides, `#rrggbb`. Persisted; a shared link carries them. */
 const hlOverrides = new Map<string, string>();
@@ -245,15 +252,26 @@ function readHash(): { sel: Selection; x: number; z: number; zoom: number } | nu
   };
 }
 
+let hashTimer: number | null = null;
+
+/** Debounced: a wheel step fires zoomend and moveend back to back, and Safari
+ *  throws past ~100 replaceState calls per 30 s — which, thrown from inside
+ *  Leaflet's event dispatch, would abort the tile layers' own moveend work. */
 function writeHash() {
+  if (hashTimer !== null) clearTimeout(hashTimer);
+  hashTimer = window.setTimeout(writeHashNow, 250);
+}
+
+function writeHashNow() {
+  hashTimer = null;
   const c = fromLatLng(map.getCenter());
   let h = `#/${sel.w}/${sel.d}/${sel.m}/${sel.layer}/${Math.round(c.x)}/${Math.round(
     c.z
   )}/${map.getZoom()}`;
   const params: string[] = [];
-  if (hlEnabled.size > 0) params.push(`hl=${[...hlEnabled].map(hlLabel).join(',')}`);
+  if (hlEnabled.size > 0) params.push(`hl=${[...hlEnabled].map(hlHashName).join(',')}`);
   if (hlOverrides.size > 0) {
-    const pairs = [...hlOverrides].map(([db, c]) => `${hlLabel(db)}:${c.slice(1)}`);
+    const pairs = [...hlOverrides].map(([db, c]) => `${hlHashName(db)}:${c.slice(1)}`);
     params.push(`hlc=${pairs.join(',')}`);
   }
   const roofQ = roofQuery();
@@ -263,7 +281,11 @@ function writeHash() {
   if (($('toggle-atlas-under') as HTMLInputElement)?.checked) params.push('au=1');
   if (followName) params.push(`follow=${encodeURIComponent(followName)}`);
   if (params.length) h += `?${params.join('&')}`;
-  history.replaceState(null, '', h);
+  try {
+    history.replaceState(null, '', h);
+  } catch {
+    /* Safari's replaceState rate limit: the next move rewrites it */
+  }
 }
 
 // -------------------------------------------------------------------- map --
@@ -336,16 +358,24 @@ function setupMap() {
 
 let netherUnderlayUrl = '';
 
+/** Index of the Nether multiworld that pairs with the selected Overworld one:
+ *  matched by id, since the two dimensions' multiworld lists are independent
+ *  and the same index can name different worlds. */
+function netherMwIdx(netherIdx: number): number {
+  const w = currentWorld();
+  if (!w || netherIdx < 0) return 0;
+  const wantId = currentDim()?.mws[sel.m]?.id;
+  const i = w.dims[netherIdx].mws.findIndex((m) => m.id === wantId);
+  return i >= 0 ? i : 0;
+}
+
 function updateNetherToggle() {
   const row = $('row-nether');
   const cb = $('toggle-nether') as HTMLInputElement;
   const isOverworld = currentDim()?.dimType === 'overworld';
   const netherIdx = currentWorld()?.dims.findIndex((d) => d.dimType === 'the_nether') ?? -1;
   row.hidden = !isOverworld || netherIdx < 0;
-  const mwIdx =
-    netherIdx < 0
-      ? 0
-      : Math.min(sel.m, Math.max(0, (currentWorld()!.dims[netherIdx].mws.length ?? 1) - 1));
+  const mwIdx = netherMwIdx(netherIdx);
   const wantUrl =
     !row.hidden && cb.checked
       ? `./tiles/${sel.w}/${netherIdx}/${mwIdx}/surface/{z}/{x}/{y}${roofQuery()}`
@@ -676,6 +706,38 @@ async function loadAtlasStore(): Promise<AtlasLocation[] | null> {
   }
 }
 
+/** Third-party rows, kept only when every field we render has the type we
+ *  expect. A bad row is dropped rather than trusted into HTML or storage, and
+ *  this runs on every load path — download, server store, browser cache — so
+ *  nothing persisted under an older build gets replayed unchecked. */
+function sanitizeAtlas(raw: unknown): AtlasLocation[] {
+  if (!Array.isArray(raw)) return [];
+  const str = (v: unknown) => (typeof v === 'string' ? v : null);
+  const out: AtlasLocation[] = [];
+  for (const l of raw as Record<string, unknown>[]) {
+    if (!l || typeof l !== 'object') continue;
+    const name = str(l.name);
+    const x = Number(l.x);
+    const y = Number(l.y);
+    const z = Number(l.z);
+    const dimension = Number(l.dimension);
+    if (name === null || ![x, y, z, dimension].every(Number.isFinite)) continue;
+    out.push({
+      name,
+      description: str(l.description) ?? '',
+      tags: str(l.tags),
+      dimension,
+      x,
+      y,
+      z,
+      wiki: str(l.wiki),
+      videoUrl: str(l.videoUrl),
+      dateAddedUtc: str(l.dateAddedUtc) ?? '',
+    });
+  }
+  return out;
+}
+
 /** The only code path in the viewer that talks to api.blackportal.cloud, and
  *  it only ever runs from a click. Slims the payload to the ten fields we
  *  render and hands it to the server so no browser has to fetch it again. */
@@ -684,19 +746,7 @@ async function downloadAtlas(): Promise<boolean> {
   try {
     const res = await fetch(ATLAS_URL);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const raw = (await res.json()) as AtlasLocation[];
-    atlasData = raw.map((l) => ({
-      name: l.name,
-      description: l.description,
-      tags: l.tags,
-      dimension: l.dimension,
-      x: l.x,
-      y: l.y,
-      z: l.z,
-      wiki: l.wiki,
-      videoUrl: l.videoUrl,
-      dateAddedUtc: l.dateAddedUtc,
-    }));
+    atlasData = sanitizeAtlas(await res.json());
     atlasFetchedMs = Date.now();
     if (!(await putAtlasStore(atlasData))) {
       // No server-side store (older build): keep it in this browser instead.
@@ -732,7 +782,7 @@ async function toggleAtlas(allowRemote: boolean) {
   }
   if (!atlasData) {
     $('atlas-count').textContent = 'loading…';
-    atlasData = await loadAtlasStore();
+    atlasData = sanitizeAtlas(await loadAtlasStore());
   }
   if (!atlasData) {
     if (!allowRemote) {
@@ -799,7 +849,7 @@ function redrawAtlas() {
     marker.bindPopup(
       `<div class="wp-popup"><b>${escapeHtml(loc.name)}</b><br>` +
         (loc.description ? `${escapeHtml(loc.description)}<br>` : '') +
-        `<span class="muted">${loc.x}, ${loc.y}, ${loc.z} · added ${escapeHtml(
+        `<span class="muted">${escapeHtml(`${loc.x}, ${loc.y}, ${loc.z}`)} · added ${escapeHtml(
           (loc.dateAddedUtc ?? '').slice(0, 10)
         )}</span><br>${tags}${links ? `<br>${links}` : ''}</div>`
     );
@@ -943,6 +993,16 @@ let previewLayer: L.TileLayer | null = null;
 /** Dim resource key the layer currently shows, '' when off. */
 let previewDim = '';
 
+/** A dimension's resource key — what live events and waypoint files carry.
+ *  `dimType` is only a behaviour hint (a custom dimension that behaves like the
+ *  Overworld reports "overworld"), so the id wins whenever the server has it. */
+function dimKeyOf(d: { dimId?: string | null; dimType: string | null; folder: string }): string {
+  if (d.dimId) return d.dimId;
+  const t = d.dimType;
+  if (t === 'overworld' || t === 'the_nether' || t === 'the_end') return `minecraft:${t}`;
+  return t ?? d.folder;
+}
+
 /** The current dimension's resource key (what the preview canvas is keyed by). */
 function currentDimKey(): string | null {
   const dim = currentDim();
@@ -1059,6 +1119,9 @@ function toggleGrid() {
       maxZoom: 3,
       maxNativeZoom: 0,
       minNativeZoom: -16,
+      // Above the Nether underlay (1) and base (2): the grid is a reference,
+      // it must never be painted over by imagery added later.
+      zIndex: 6,
     });
     gridLayer!.addTo(map);
   }
@@ -1069,10 +1132,9 @@ function toggleGrid() {
 function dimMatches(file: WaypointFileJson): boolean {
   const dim = currentDim();
   if (!dim) return false;
-  const norm = (s: string | null) => (s ? s.replace(/^minecraft:/, '') : null);
-  const want = norm(dim.dimType) ?? dim.folder;
-  const have = norm(file.dimKey) ?? file.dimFolder;
-  return want === have;
+  const norm = (s: string) => s.replace(/^minecraft:/, '');
+  if (file.dimKey) return norm(file.dimKey) === norm(dimKeyOf(dim));
+  return file.dimFolder === dim.folder;
 }
 
 function visibleWaypoints(): { wp: WaypointJson; file: WaypointFileJson }[] {
@@ -1290,6 +1352,7 @@ function handleLiveEvent(ev: LiveEvent) {
       applyPos(ev, false);
       break;
     case 'player_removed': {
+      liveLastSeq = ev.v;
       const p = livePlayers.get(ev.player);
       if (p) {
         removePlayerVisuals(p);
@@ -1375,11 +1438,7 @@ function handleTilesEvent(ev: TilesEvent) {
   }
   if (netherUnderlay && ev.layer === 'surface') {
     const netherIdx = currentWorld()?.dims.findIndex((d) => d.dimType === 'the_nether') ?? -1;
-    const mwIdx = Math.min(
-      sel.m,
-      Math.max(0, (currentWorld()?.dims[netherIdx]?.mws.length ?? 1) - 1)
-    );
-    if (ev.d === netherIdx && ev.m === mwIdx) {
+    if (netherIdx >= 0 && ev.d === netherIdx && ev.m === netherMwIdx(netherIdx)) {
       refreshLayerTiles(netherUnderlay, ev.regions, ev.deep, ev.v);
     }
   }
@@ -1422,8 +1481,15 @@ function refreshAllTileLayers(seq: number) {
  * ingest rescans every time a mapping client uploads into a brand-new
  * layer — nothing visible is rebuilt: tearing the tile layers down just to
  * recreate identical ones made the whole map flash on every such upload. */
+let resyncAgain = false;
+
 async function resyncState() {
-  if (resyncing) return;
+  if (resyncing) {
+    // A second rescan finished during the fetch; its state is newer than
+    // what is in flight, so go once more when this pass is done.
+    resyncAgain = true;
+    return;
+  }
   resyncing = true;
   try {
     const before = { ...sel };
@@ -1470,6 +1536,10 @@ async function resyncState() {
       // catch the loss — refresh in place exactly like a lagged reconnect.
       refreshAllTileLayers(liveLastSeq);
     }
+  }
+  if (resyncAgain) {
+    resyncAgain = false;
+    void resyncState();
   }
 }
 
@@ -1543,8 +1613,7 @@ function dimKeyMatchesCurrent(dimKey: string): boolean {
   const dim = currentDim();
   if (!dim) return false;
   const norm = (s: string) => s.replace(/^minecraft:/, '');
-  const have = dim.dimType ? norm(dim.dimType) : dim.folder;
-  return norm(dimKey) === have;
+  return norm(dimKey) === norm(dimKeyOf(dim));
 }
 
 function updatePlayerVisuals(p: LivePlayer) {
@@ -1726,11 +1795,7 @@ function renderPlayerList() {
 function switchToDim(dimKey: string): boolean {
   if (dimKeyMatchesCurrent(dimKey)) return true;
   const norm = (s: string) => s.replace(/^minecraft:/, '');
-  const idx =
-    currentWorld()?.dims.findIndex((d) => {
-      const have = d.dimType ? norm(d.dimType) : d.folder;
-      return norm(dimKey) === have;
-    }) ?? -1;
+  const idx = currentWorld()?.dims.findIndex((d) => norm(dimKey) === norm(dimKeyOf(d))) ?? -1;
   if (idx < 0) return false;
   sel.d = idx;
   sel.m = 0;
@@ -2066,10 +2131,14 @@ function makeDraggable(p: HTMLElement, handle: HTMLElement) {
     const up = () => {
       handle.removeEventListener('pointermove', move);
       handle.removeEventListener('pointerup', up);
+      handle.removeEventListener('pointercancel', up);
       savePanel(p.id);
     };
     handle.addEventListener('pointermove', move);
     handle.addEventListener('pointerup', up);
+    // A touch turning into a scroll cancels the pointer; without this the
+    // listeners stay and stack up on the next drag.
+    handle.addEventListener('pointercancel', up);
     e.preventDefault();
   });
 }
@@ -2219,6 +2288,11 @@ function applySelection() {
   sel.w = Math.min(sel.w, state.worlds.length - 1);
   sel.d = Math.min(sel.d, Math.max(0, (currentWorld()?.dims.length ?? 1) - 1));
   sel.m = Math.min(sel.m, Math.max(0, (currentDim()?.mws.length ?? 1) - 1));
+  // A measurement is in one dimension's coordinates; it does not carry over.
+  if (measure) {
+    if (measure.line) map.removeLayer(measure.line);
+    measure = { points: [], line: null };
+  }
   rebuildSidebar();
   replaceBaseLayer();
   updateIngestOverlay();
@@ -2436,7 +2510,7 @@ function syncHlLayers() {
 
 function addHlLayer(w: number, d: number, db: string): L.TileLayer {
   const color = hlColor(db).replace('#', '');
-  const layer = L.tileLayer(`./hl/${w}/${db}/${d}/{z}/{x}/{y}?c=${color}`, {
+  const layer = L.tileLayer(`./hl/${w}/${encodeURIComponent(db)}/${d}/{z}/{x}/{y}?c=${color}`, {
     tileSize: 512,
     minZoom: -16,
     maxZoom: 3,
@@ -2514,14 +2588,9 @@ function wireEvents() {
   roofCb.onchange = applyRoof;
   $('roof-obsidian').onchange = applyRoof;
   $('roof-snow').onchange = applyRoof;
-  // A hash link wins over the remembered choice; otherwise restore it. The
-  // layers were built before this point, so restoring has to rebuild them.
-  if (!roofCb.checked && localStorage.getItem('xt-roof') === '1') {
-    roofCb.checked = true;
-    applyRoof();
-  } else {
-    $('roof-opts').hidden = !roofCb.checked;
-  }
+  // The checkbox was settled in boot() before the first layer build (hash
+  // link first, remembered choice second), so no rebuild is needed here.
+  $('roof-opts').hidden = !roofCb.checked;
   $('toggle-nether').onchange = updateNetherToggle;
   $('toggle-atlas').onchange = () => toggleAtlas(true);
   $('atlas-refresh').onclick = refreshAtlas;
@@ -2554,8 +2623,11 @@ function wireEvents() {
     redrawWaypoints();
   };
   $('goto-btn').onclick = () => {
-    const x = +($('goto-x') as HTMLInputElement).value;
-    const z = +($('goto-z') as HTMLInputElement).value;
+    const xs = ($('goto-x') as HTMLInputElement).value.trim();
+    const zs = ($('goto-z') as HTMLInputElement).value.trim();
+    if (!xs || !zs) return; // `+''` is 0, which would silently jump to the axis
+    const x = +xs;
+    const z = +zs;
     if (Number.isFinite(x) && Number.isFinite(z)) {
       map.setView(toLatLng(x, z), Math.max(map.getZoom(), 0));
     }
@@ -2823,13 +2895,18 @@ async function boot() {
   setupMap();
   initPanels();
   const fromHash = readHash();
+  // View and roof choice are settled before the first layer build: building
+  // at the default view first would fire a burst of spawn-tile requests
+  // (the most expensive renders there are) that the setView then abandons,
+  // and restoring the roof afterwards would rebuild every layer a second
+  // time. A hash link wins over the remembered roof choice.
   if (fromHash) {
     sel = fromHash.sel;
-    applySelection();
     map.setView(toLatLng(fromHash.x, fromHash.z), fromHash.zoom);
-  } else {
-    applySelection();
   }
+  const roofCb = $('toggle-roof') as HTMLInputElement;
+  if (!roofCb.checked && localStorage.getItem('xt-roof') === '1') roofCb.checked = true;
+  applySelection();
   // A permalink pasted into the open tab. Our own writeHash goes through
   // replaceState, which never fires this, so it only runs for outside edits.
   addEventListener('hashchange', () => {

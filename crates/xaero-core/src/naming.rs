@@ -36,7 +36,9 @@ impl Dimension {
             "DIM-1" => Some(Dimension::Nether),
             "DIM1" => Some(Dimension::End),
             _ => {
-                if folder.contains('$') {
+                // `mw$default` and friends also carry a `$`; a root pointed
+                // at a dimension folder must not read them as dimensions.
+                if folder.contains('$') && !is_multiworld_folder(folder) {
                     Some(Dimension::Custom(unescape_folder_id(folder)))
                 } else {
                     None
@@ -127,7 +129,12 @@ pub fn parse_region_filename(name: &str) -> Option<(i32, i32, bool)> {
         (s, false)
     };
     let (a, b) = stem.split_once('_')?;
-    // Reject stray files like `12_34_backup`: both halves must be pure ints.
+    // Reject stray files like `12_34_backup`: both halves must be pure ints,
+    // and the mod's regex (`-?\d+`) takes no `+` sign where `i32::from_str`
+    // would — `+0_5.zip` is not a region the game reads.
+    if a.starts_with('+') || b.starts_with('+') {
+        return None;
+    }
     Some((a.parse().ok()?, b.parse().ok()?, is_zip))
 }
 
@@ -195,9 +202,13 @@ pub fn is_minimap_backup_dir_name(name: &str) -> bool {
 /// than the mod, and are therefore never live region data and never worth
 /// copying: `*.temp`, `*.outdated`, `*.xwmc` render caches, Xaero's
 /// `*.backup<n>` (and XaeroPlus's `*.backup<n>-xp-<n>`), Syncthing conflict
-/// copies, SQLite sidecars, `.lock`.
+/// copies, SQLite sidecars, `.lock`, and our own merge/ingest temp files
+/// (`*.tmp-xt`, `*.zip.tmp*`) that a killed run can leave behind.
 pub fn is_transient_artifact(name: &str) -> bool {
     if name.ends_with(".temp") || name.ends_with(".outdated") || name == ".lock" {
+        return true;
+    }
+    if name.ends_with(".tmp-xt") || name.contains(".zip.tmp") {
         return true;
     }
     if name.ends_with(".xwmc") {
@@ -293,6 +304,11 @@ mod tests {
             Some(Dimension::Custom("minecraft:worlds/2b2t/2b2t_1".into()))
         );
         assert_eq!(Dimension::from_worldmap_folder("random"), None);
+        // Multiworld folder names are never dimensions.
+        assert_eq!(Dimension::from_worldmap_folder("mw$default"), None);
+        assert_eq!(Dimension::from_worldmap_folder("mw$-542221765"), None);
+        assert_eq!(Dimension::from_worldmap_folder("cm$converted"), None);
+        assert_eq!(Dimension::from_worldmap_folder("mw1,2,3"), None);
         assert_eq!(
             Dimension::Custom("minecraft:worlds/2b2t/2b2t_1".into()).to_worldmap_folder(true),
             "minecraft$worlds%2b2t%2b2t_1"
@@ -328,6 +344,8 @@ mod tests {
         assert_eq!(parse_region_filename("0_-24.zip.temp"), None);
         assert_eq!(parse_region_filename("12_34_x.zip"), None);
         assert_eq!(parse_region_filename("cache_1"), None);
+        assert_eq!(parse_region_filename("+5_3.zip"), None);
+        assert_eq!(parse_region_filename("5_+3.zip"), None);
         assert_eq!(region_filename(-3, 7), "-3_7.zip");
     }
 
@@ -397,6 +415,33 @@ mod tests {
             "dimension_config.txt",
         ] {
             assert!(!is_transient_artifact(keep), "{keep}");
+        }
+    }
+
+    #[test]
+    fn transient_artifacts() {
+        for name in [
+            "0_0.zip.temp",
+            "0_0.outdated",
+            "0_0.xwmc",
+            ".lock",
+            "XaeroPlusNewChunks.db-wal",
+            "0_0.zip.backup1",
+            "0_0.zip.backup2-xp-3",
+            "0_0.sync-conflict-20240705-215039-Q.zip",
+            "0_0.zip.tmp-xt",
+            "0_0.zip.tmp",
+            "0_0.zip.tmp-abc",
+        ] {
+            assert!(is_transient_artifact(name), "{name}");
+        }
+        for name in [
+            "0_0.zip",
+            "0_0.xaero",
+            "dimension_config.txt",
+            "XaeroPlusNewChunks.db",
+        ] {
+            assert!(!is_transient_artifact(name), "{name}");
         }
     }
 

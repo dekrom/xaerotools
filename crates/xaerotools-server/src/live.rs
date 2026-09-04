@@ -982,12 +982,18 @@ pub(crate) struct PositionReq {
 /// cross-origin requests are rejected, and both ingest routes require
 /// non-simple content types (JSON / octet-stream) anyway, which no hostile
 /// page can send to us without a CORS preflight we never answer.
+///
+/// `exempt` is `AppState::loopback_exempt`: the peer address only means
+/// "this machine" while the server itself listens on loopback. Under `--lan`,
+/// or with a reverse proxy in front (which makes every client a loopback
+/// peer), or with `--ingest-require-token`, there is no exemption at all.
 pub(crate) fn local_player(
+    exempt: bool,
     headers: &HeaderMap,
     peer: SocketAddr,
     declared: Option<&str>,
 ) -> Result<String, (StatusCode, &'static str)> {
-    if !peer.ip().to_canonical().is_loopback() {
+    if !exempt || !peer.ip().to_canonical().is_loopback() {
         return Err((StatusCode::UNAUTHORIZED, "missing bearer token"));
     }
     if !origin_ok(headers) {
@@ -1009,6 +1015,14 @@ pub(crate) fn local_player(
     Ok(name.to_string())
 }
 
+/// Who an ingest request acts as, and how that was established.
+pub(crate) struct IngestAuth {
+    pub(crate) player: String,
+    /// No token was presented and the loopback exemption applied — the
+    /// client is a process on this machine, not a remote one.
+    pub(crate) local: bool,
+}
+
 /// Resolves the acting player for an ingest request. A presented token must
 /// be valid even from loopback — a revoked or mistyped token fails loudly
 /// instead of silently falling back; only a request with *no* token at all
@@ -1021,12 +1035,17 @@ pub(crate) async fn ingest_player(
     headers: &HeaderMap,
     peer: SocketAddr,
     declared: Option<&str>,
-) -> Result<String, Response> {
+) -> Result<IngestAuth, Response> {
     // Hot-reload the config on every attempt (stat throttled to 1/s) so
     // `tokens generate` works immediately and `tokens revoke` actually revokes.
     maybe_reload_config(st);
     let Some(token) = bearer_token(headers) else {
-        return local_player(headers, peer, declared).map_err(|e| e.into_response());
+        return local_player(st.loopback_exempt, headers, peer, declared)
+            .map(|player| IngestAuth {
+                player,
+                local: true,
+            })
+            .map_err(|e| e.into_response());
     };
     let player = st
         .config
@@ -1042,7 +1061,10 @@ pub(crate) async fn ingest_player(
         return Err((StatusCode::UNAUTHORIZED, "unknown token").into_response());
     };
     st.live.note_auth_ok();
-    Ok(player)
+    Ok(IngestAuth {
+        player,
+        local: false,
+    })
 }
 
 pub(crate) async fn ingest_position(
@@ -1052,10 +1074,11 @@ pub(crate) async fn ingest_position(
     body: axum::Json<PositionReq>,
 ) -> Response {
     let player = match ingest_player(&st, &headers, peer, Some(&body.player)).await {
-        Ok(p) => p,
+        Ok(a) => a.player,
         Err(resp) => return resp,
     };
-    if body.player != player {
+    // The loopback path trimmed the declared name; compare what it compared.
+    if body.player.trim() != player {
         return (StatusCode::FORBIDDEN, "token belongs to a different player").into_response();
     }
     let Some(dim) = normalize_dim(&body.dim) else {
@@ -1065,7 +1088,7 @@ pub(crate) async fn ingest_position(
         return (StatusCode::BAD_REQUEST, "coordinates out of range").into_response();
     }
     {
-        let mut rate = st.live.rate.lock().unwrap();
+        let mut rate = crate::lock_ok(&st.live.rate);
         let bucket = rate.entry(player.clone()).or_insert(Bucket {
             tokens: RATE_BURST,
             last_ms: now_ms(),
@@ -1083,7 +1106,7 @@ pub(crate) async fn ingest_position(
         t_ms: now_ms(),
     };
     let msg = pos_value(&player, &pos).to_string();
-    st.live.positions.lock().unwrap().insert(player, pos);
+    crate::lock_ok(&st.live.positions).insert(player, pos);
     let _ = st.live.tx.send(msg);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1104,12 +1127,14 @@ pub(crate) fn maybe_reload_config(st: &AppState) {
         return;
     }
     cache.last_stat = Instant::now();
-    let mtime = config::mtime_ms(&st.config_path);
-    if mtime != cache.mtime {
+    // mtime plus length: a generate followed by a revoke inside one mtime
+    // tick (coarse filesystems round to seconds) still changes the length.
+    let stamp = config::file_stamp(&st.config_path);
+    if stamp != cache.stamp {
         match config::load(&st.config_path) {
             Ok(file) => {
                 cache.file = file;
-                cache.mtime = mtime;
+                cache.stamp = stamp;
             }
             Err(e) => eprintln!("config reload failed: {e}"),
         }
@@ -1337,35 +1362,47 @@ mod tests {
         let none = HeaderMap::new();
 
         assert_eq!(
-            local_player(&none, lo, Some("Account1")).unwrap(),
+            local_player(true, &none, lo, Some("Account1")).unwrap(),
             "Account1"
         );
         assert_eq!(
-            local_player(&none, lo6, Some("Account1")).unwrap(),
+            local_player(true, &none, lo6, Some("Account1")).unwrap(),
             "Account1"
         );
         // Remote peers must present a token; the declared name buys nothing.
         assert_eq!(
-            local_player(&none, lan, Some("Account1")).unwrap_err().0,
+            local_player(true, &none, lan, Some("Account1"))
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        // With the exemption off (--lan, a proxy in front, or
+        // --ingest-require-token) a loopback peer is just another client.
+        assert_eq!(
+            local_player(false, &none, lo, Some("Account1"))
+                .unwrap_err()
+                .0,
             StatusCode::UNAUTHORIZED
         );
         // No usable name, or one that can't become a directory.
-        assert!(local_player(&none, lo, None).is_err());
-        assert!(local_player(&none, lo, Some("  ")).is_err());
-        assert!(local_player(&none, lo, Some("../evil")).is_err());
+        assert!(local_player(true, &none, lo, None).is_err());
+        assert!(local_player(true, &none, lo, Some("  ")).is_err());
+        assert!(local_player(true, &none, lo, Some("../evil")).is_err());
         // A browser page on another origin is not "local".
         let mut cross = HeaderMap::new();
         cross.insert(header::ORIGIN, "http://evil.example".parse().unwrap());
         cross.insert(header::HOST, "127.0.0.1:45746".parse().unwrap());
         assert_eq!(
-            local_player(&cross, lo, Some("Account1")).unwrap_err().0,
+            local_player(true, &cross, lo, Some("Account1"))
+                .unwrap_err()
+                .0,
             StatusCode::FORBIDDEN
         );
         // The viewer's own origin passes, as does a non-browser client (no Origin).
         let mut same = HeaderMap::new();
         same.insert(header::ORIGIN, "http://127.0.0.1:45746".parse().unwrap());
         same.insert(header::HOST, "127.0.0.1:45746".parse().unwrap());
-        assert!(local_player(&same, lo, Some("Account1")).is_ok());
+        assert!(local_player(true, &same, lo, Some("Account1")).is_ok());
     }
 
     #[test]

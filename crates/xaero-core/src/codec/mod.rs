@@ -44,6 +44,8 @@ pub enum CodecError {
     },
     #[error("zip container error: {0}")]
     Zip(String),
+    #[error("region stream is {bytes} bytes, over the {limit}-byte limit")]
+    TooLarge { bytes: u64, limit: u64 },
     #[error("invalid NBT in state palette: {0}")]
     Nbt(String),
 }
