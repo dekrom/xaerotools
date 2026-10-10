@@ -1,4 +1,8 @@
-//! Region stream encoder. Always emits the current format: major 7, minor 8.
+//! Region stream encoder. Always emits major 7, minor 8 — loaded by every
+//! build of the mod since 7.8 appeared. 8.8 is newer, but only the Minecraft
+//! 26.3 build reads it (older builds move such a file aside), while 26.3 reads 7.8
+//! by respelling the block-state keys, the exact inverse of what the decoder
+//! did to a major-8 palette.
 //!
 //! Palette handling: indices in the file are region-local, assigned in first
 //! appearance order. The encoder walks pixels in serialization order and
@@ -362,6 +366,59 @@ mod tests {
             assert_eq!(after.palettes.biome_names[b as usize], *want, "pixel {i}");
             assert_eq!(px.params & P_BIOME_NUMERIC, 0);
         }
+    }
+
+    /// Major 8 (Minecraft 26.3) keys block states `id`/`properties`. Pixel and
+    /// overlay states both come back in the 7.x spelling, so the 7.8 output
+    /// names them for every 7.8-capable build, and a later index still refers
+    /// to the same entry.
+    #[test]
+    fn major8_states_reencode_in_the_7x_spelling() {
+        fn state(id: &str, props: Option<(&str, &str)>) -> Vec<u8> {
+            let mut nbt = vec![10, 0, 0];
+            if let Some((k, v)) = props {
+                nbt.extend_from_slice(&[10, 0, 10]);
+                nbt.extend_from_slice(b"properties");
+                nbt.extend_from_slice(&[8, 0, k.len() as u8]);
+                nbt.extend_from_slice(k.as_bytes());
+                nbt.extend_from_slice(&[0, v.len() as u8]);
+                nbt.extend_from_slice(v.as_bytes());
+                nbt.push(0);
+            }
+            nbt.extend_from_slice(&[8, 0, 2]);
+            nbt.extend_from_slice(b"id");
+            nbt.extend_from_slice(&[0, id.len() as u8]);
+            nbt.extend_from_slice(id.as_bytes());
+            nbt.push(0);
+            nbt
+        }
+        let mut p0 = params(P_NOT_GRASS | P_STATE_NEW | P_HAS_OVERLAYS);
+        p0.extend_from_slice(&state("minecraft:oak_log", Some(("axis", "y"))));
+        p0.push(1); // one overlay, non-water, new palette entry
+        p0.extend_from_slice(&params(O_NOT_WATER | O_STATE_NEW));
+        p0.extend_from_slice(&state("minecraft:ice", None));
+        let mut p1 = params(P_NOT_GRASS);
+        p1.extend_from_slice(&1i32.to_be_bytes()); // index 1 = ice
+        let mut trailer = vec![0u8];
+        trailer.extend_from_slice(&i32::MAX.to_be_bytes());
+        trailer.push(32);
+        let s = stream(8, 8, &[p0, p1], &trailer);
+        let (before, after) = round_trip(&s);
+        assert_eq!((before.version.major, before.version.minor), (8, 8));
+        for dr in [&before, &after] {
+            assert_eq!(
+                dr.palettes.state_names,
+                vec!["minecraft:oak_log", "minecraft:ice"]
+            );
+            let t = tile(dr);
+            assert_eq!(t.pixels[0].overlays[0].state, Some(1));
+            assert_eq!(t.pixels[1].state, Some(1));
+        }
+        let log = &after.palettes.states[0];
+        let has = |needle: &[u8]| log.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"\x08\x00\x04Name") && has(b"\x0a\x00\x0aProperties"));
+        assert!(!has(b"\x00\x02id") && !has(b"properties"));
+        assert_eq!(before.palettes, after.palettes);
     }
 
     /// A hand-built pixel whose word claims a state or overlays it does not

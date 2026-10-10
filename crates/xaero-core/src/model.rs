@@ -13,7 +13,9 @@
 //! Palette entries are stored as the **raw bytes read from the file** (NBT for
 //! block states, Java-UTF payload for biomes) plus a decoded name for
 //! rendering. Raw bytes are re-emitted verbatim on encode, so we never need a
-//! lossless NBT round-trip through a parsed tree.
+//! lossless NBT round-trip through a parsed tree. The one exception is a
+//! major-8 block state, whose two root keys are respelled to the 7.x names on
+//! read (`codec::nbt::read_state_nbt`); its payloads stay byte-for-byte.
 
 use smallvec::SmallVec;
 
@@ -162,7 +164,8 @@ impl Region {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Palettes {
-    /// Raw NBT bytes (NbtIo framing) per block/overlay state, file order.
+    /// Raw NBT bytes (NbtIo framing) per block/overlay state, file order, in
+    /// the 7.x `Name`/`Properties` spelling (major-8 entries are respelled).
     pub states: Vec<Vec<u8>>,
     /// Extracted `Name` of each state (e.g. "minecraft:netherrack"), for rendering.
     pub state_names: Vec<String>,

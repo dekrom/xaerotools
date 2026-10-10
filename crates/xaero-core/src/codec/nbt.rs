@@ -5,6 +5,9 @@
 //! payload until TAG_End. We never need to materialize a tree: we locate the
 //! end of the tag (so the raw bytes can be captured verbatim for re-emission)
 //! and extract the root `Name` string for rendering.
+//!
+//! Save major 8 (Minecraft 26.3) spells the two root keys `id`/`properties`
+//! instead; [`read_state_nbt`] renames them back on read.
 
 use super::{Eof, Rd};
 
@@ -32,10 +35,70 @@ pub const TAG_INT_ARRAY: u8 = 11;
 pub const TAG_LONG_ARRAY: u8 = 12;
 
 pub struct RawNbt {
-    /// Exact bytes of the named root tag, as they appeared in the stream.
+    /// Bytes of the named root tag: exactly as they appeared in the stream,
+    /// except that a major-8 state has its keys respelled by [`read_state_nbt`].
     pub raw: Vec<u8>,
     /// Value of the root compound's "Name" string entry, if present.
     pub name: Option<String>,
+}
+
+/// Reads one block-state palette entry written under save `major`, returned in
+/// the `Name`/`Properties` spelling of majors 1..=7.
+///
+/// Minecraft 26.3 renamed the root keys of a block state's NBT to
+/// `id`/`properties`, and Xaero's World Map marks regions written that way as
+/// major 8. On load it renames older entries forward
+/// (`OldFormatSupport.fixBlockState262_263`); this applies the exact inverse,
+/// so one palette spelling serves every major, the 7.8 writer's output stays
+/// loadable by every build that reads 7.8, and the 26.3 build's own fix turns it
+/// back into what it wrote.
+pub(crate) fn read_state_nbt(rd: &mut Rd<'_>, major: u16) -> Result<RawNbt, Eof> {
+    if major < 8 {
+        return read_named_nbt(rd);
+    }
+    let start = rd.pos;
+    if rd.u8()? != TAG_COMPOUND {
+        // Not a block state at all: keep it verbatim, as the older majors do.
+        rd.pos = start;
+        return read_named_nbt(rd);
+    }
+    let name_len = rd.u16()? as usize;
+    rd.take(name_len)?;
+    let mut raw = rd.buf[start..rd.pos].to_vec();
+    let mut name: Option<String> = None;
+    loop {
+        let entry = rd.pos;
+        let tag = rd.u8()?;
+        if tag == TAG_END {
+            raw.push(TAG_END);
+            break;
+        }
+        let key_len = rd.u16()? as usize;
+        let key = rd.take(key_len)?;
+        let payload = rd.pos;
+        skim_payload(rd, tag, 1)?;
+        let respelled: &[u8] = match (tag, key) {
+            (TAG_STRING, b"id") => {
+                if name.is_none() {
+                    name = Some(decode_java_utf(&rd.buf[payload + 2..rd.pos]));
+                }
+                b"Name"
+            }
+            (TAG_COMPOUND, b"properties") => b"Properties",
+            // The 26.3 reader never consults the old keys, so a stray one is
+            // dropped rather than left to shadow the respelled entry.
+            (TAG_STRING, b"Name") | (TAG_COMPOUND, b"Properties") => continue,
+            _ => {
+                raw.extend_from_slice(&rd.buf[entry..rd.pos]);
+                continue;
+            }
+        };
+        raw.push(tag);
+        raw.extend_from_slice(&(respelled.len() as u16).to_be_bytes());
+        raw.extend_from_slice(respelled);
+        raw.extend_from_slice(&rd.buf[payload..rd.pos]);
+    }
+    Ok(RawNbt { raw, name })
 }
 
 /// Reads one named NBT root tag from the cursor. Returns Err(Eof) on
@@ -236,6 +299,87 @@ mod tests {
         let nbt = read_named_nbt(&mut rd).ok().unwrap();
         assert_eq!(nbt.name.as_deref(), Some("a:b"));
         assert_eq!(rd.remaining(), 0);
+    }
+
+    /// Named root compound (empty root name) of `(tag, key, payload)` entries.
+    fn compound(entries: &[(u8, &str, Vec<u8>)]) -> Vec<u8> {
+        let mut raw = vec![TAG_COMPOUND, 0x00, 0x00];
+        raw.extend_from_slice(&compound_payload(entries));
+        raw
+    }
+
+    fn compound_payload(entries: &[(u8, &str, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (tag, key, payload) in entries {
+            out.push(*tag);
+            out.extend_from_slice(&(key.len() as u16).to_be_bytes());
+            out.extend_from_slice(key.as_bytes());
+            out.extend_from_slice(payload);
+        }
+        out.push(TAG_END);
+        out
+    }
+
+    fn string_payload(s: &str) -> Vec<u8> {
+        let mut out = (s.len() as u16).to_be_bytes().to_vec();
+        out.extend_from_slice(s.as_bytes());
+        out
+    }
+
+    #[test]
+    fn major8_state_keys_are_respelled_in_place() {
+        let props = compound_payload(&[(TAG_STRING, "axis", string_payload("y"))]);
+        let mut raw = compound(&[
+            (TAG_COMPOUND, "properties", props.clone()),
+            (TAG_STRING, "id", string_payload("minecraft:oak_log")),
+        ]);
+        raw.extend_from_slice(&[0xAA, 0xBB]); // trailing junk must not be consumed
+        let mut rd = Rd::new(&raw);
+        let nbt = read_state_nbt(&mut rd, 8).ok().unwrap();
+        assert_eq!(nbt.name.as_deref(), Some("minecraft:oak_log"));
+        assert_eq!(
+            nbt.raw,
+            compound(&[
+                (TAG_COMPOUND, "Properties", props),
+                (TAG_STRING, "Name", string_payload("minecraft:oak_log")),
+            ]),
+            "keys respelled, entry order and payloads untouched"
+        );
+        assert_eq!(rd.remaining(), 2);
+    }
+
+    #[test]
+    fn major8_drops_old_keys_the_game_would_ignore() {
+        let raw = compound(&[
+            (TAG_STRING, "Name", string_payload("minecraft:dirt")),
+            (TAG_STRING, "id", string_payload("minecraft:stone")),
+            (TAG_BYTE, "extra", vec![1]),
+        ]);
+        let nbt = read_state_nbt(&mut Rd::new(&raw), 8).ok().unwrap();
+        assert_eq!(nbt.name.as_deref(), Some("minecraft:stone"));
+        assert_eq!(
+            nbt.raw,
+            compound(&[
+                (TAG_STRING, "Name", string_payload("minecraft:stone")),
+                (TAG_BYTE, "extra", vec![1]),
+            ])
+        );
+    }
+
+    #[test]
+    fn older_majors_keep_state_bytes_verbatim() {
+        let raw = compound(&[(TAG_STRING, "id", string_payload("minecraft:stone"))]);
+        let nbt = read_state_nbt(&mut Rd::new(&raw), 7).ok().unwrap();
+        assert_eq!(nbt.name, None);
+        assert_eq!(nbt.raw, raw);
+    }
+
+    #[test]
+    fn truncated_major8_state_is_eof() {
+        let raw = compound(&[(TAG_STRING, "id", string_payload("minecraft:stone"))]);
+        for keep in 0..raw.len() {
+            assert!(read_state_nbt(&mut Rd::new(&raw[..keep]), 8).is_err());
+        }
     }
 
     #[test]

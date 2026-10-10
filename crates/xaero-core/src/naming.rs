@@ -175,11 +175,12 @@ fn is_legacy_multiworld_folder(name: &str) -> bool {
     int(parts.next()) && int(parts.next()) && int(parts.next()) && parts.next().is_none()
 }
 
-/// Xaero moves a region file it is about to rewrite at a newer format version
-/// into a sibling `<fullVersion>_backup_<n>` dir (`MapSaveLoad.getBackupFolder`,
-/// a `Files.move`), so these dirs can hold the only surviving copy of a region.
-/// Returns the raw i32 `fullVersion` from the header (major = `v >> 16`, minor =
-/// `v & 0xFFFF`; the archive holds 2.24 through 7.8) and the slot index.
+/// Xaero moves a region file whose save version is newer than that build can
+/// read into a sibling `<fullVersion>_backup_<n>` dir (`MapSaveLoad.backupFile`,
+/// a `Files.move`) and maps the region afresh, so these dirs can hold the only
+/// surviving copy of a region — or a newer one than the live file. Returns the
+/// raw i32 `fullVersion` from the header (major = `v >> 16`, minor =
+/// `v & 0xFFFF`; the archive holds 2.24 through 8.8) and the slot index.
 pub fn parse_backup_dir_name(name: &str) -> Option<(i32, u32)> {
     let (version, index) = name.split_once("_backup_")?;
     Some((version.parse().ok()?, index.parse().ok()?))

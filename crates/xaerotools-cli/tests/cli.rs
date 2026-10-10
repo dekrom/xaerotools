@@ -238,7 +238,7 @@ fn doctor_names_every_way_a_region_can_be_bad() {
     std::fs::write(map.join("1_0.xaero"), &good[..good.len() - 10]).unwrap();
     // 2_0: a save version newer than the codec accepts.
     let mut future = vec![0xFFu8];
-    future.extend_from_slice(&((8i32 << 16) | 8).to_be_bytes());
+    future.extend_from_slice(&((9i32 << 16) | 8).to_be_bytes());
     std::fs::write(map.join("2_0.xaero"), future).unwrap();
     // 3_0: nothing at all — reported from the index, never decoded.
     std::fs::write(map.join("3_0.xaero"), b"").unwrap();

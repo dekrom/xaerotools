@@ -411,7 +411,7 @@ pub fn index_regions(map_dir: &Path) -> std::io::Result<RegionIndex> {
         let name = name.to_string_lossy();
         if entry_is_dir(&entry) {
             // `cache*`, `caves`, and `<version>_backup_<n>` — the last of which
-            // holds pre-conversion copies that shadow live coordinates and so
+            // holds moved-aside copies that shadow live coordinates and so
             // must stay out of the live index. See `scan_region_alternates`.
             continue;
         }
@@ -440,9 +440,9 @@ pub fn index_regions(map_dir: &Path) -> std::io::Result<RegionIndex> {
 /// Why a region file is not part of the live layer.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AlternateSource {
-    /// `<layer>/<version>_backup_<index>/`: the copy Xaero moved aside before
-    /// rewriting the region at a newer format version. `version` is the raw
-    /// i32 header value (major = `>> 16`, minor = `& 0xFFFF`).
+    /// `<layer>/<version>_backup_<index>/`: the copy a build of Xaero moved
+    /// aside because its save version was newer than that build reads.
+    /// `version` is the raw i32 header value (major = `>> 16`, minor = `& 0xFFFF`).
     VersionBackup { version: i32, index: u32 },
     /// `<rx>_<rz>.sync-conflict-<tag>.<ext>`: a Syncthing conflict copy left
     /// beside the live file.
@@ -468,9 +468,12 @@ pub struct RegionAlternate {
 /// conflict copies.
 ///
 /// This is an opt-in historical view. Nothing here belongs in the live map —
-/// backups shadow live coordinates at an older format version — so callers
-/// should surface it as a separate layer or a recovery report, and prefer the
-/// live copy on any tie. Ordered by (rz, rx, source).
+/// backups shadow live coordinates, and the game will not open them again —
+/// so callers should surface it as a separate layer or a recovery report, and
+/// prefer the live copy on any tie. A backup's version is *newer* than the
+/// build that moved it reads, so it can hold fresher tiles than the live file
+/// that build then wrote (26.3's `524296_backup_<n>` beside 7.8 rewrites).
+/// Ordered by (rz, rx, source).
 pub fn scan_region_alternates(map_dir: &Path) -> std::io::Result<Vec<RegionAlternate>> {
     let mut live: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
     let mut backup_dirs: Vec<(i32, u32, PathBuf)> = Vec::new();

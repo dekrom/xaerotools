@@ -19,11 +19,15 @@
 //!   overlay and per tile. Everything below minor 8 has quirks.
 //! * **`major` selects block/biome identity** — major 0 stores a numeric 1.12
 //!   block id + meta and a numeric biome id; majors 1+ store NBT blockstates in
-//!   a region palette; majors 4+ also put biomes in a palette.
+//!   a region palette; majors 4+ also put biomes in a palette; major 8
+//!   (Minecraft 26.3) keys those blockstates `id`/`properties`, which
+//!   [`read_state_nbt`] respells to the older `Name`/`Properties`.
 //!
-//! A file is accepted iff `minor <= 8 && major <= 7`, matching the mod's own
-//! gate (`MapSaveLoad.loadRegion`). Real 2b2t archives contain 0.4, 0.7, 6.7,
-//! 6.8 and 7.8; the legacy majors are roughly half of a long-lived world map.
+//! A file is accepted iff `minor <= 8 && major <= 8`, matching the gate of the
+//! mod's 26.3 build (`MapSaveLoad.loadRegion`; older builds stop at major 7 or
+//! below and move an 8.x file into `524296_backup_<n>/`). Real 2b2t archives contain
+//! 0.4, 0.7, 6.7, 6.8, 7.8 and 8.8; the legacy majors are roughly half of a
+//! long-lived world map.
 //!
 //! Truncation anywhere returns the partial region with `truncated = true`;
 //! the game's own loader has the same tolerance.
@@ -32,7 +36,7 @@ use std::collections::HashMap;
 
 use smallvec::SmallVec;
 
-use super::nbt::{decode_java_utf, read_named_nbt};
+use super::nbt::{decode_java_utf, read_state_nbt};
 use super::{CodecError, Eof, FormatVersion, Rd, legacy};
 use crate::model::*;
 
@@ -117,7 +121,7 @@ pub fn decode_region(stream: &[u8]) -> Result<DecodedRegion, CodecError> {
         } else {
             false
         };
-        if minor > 8 || major > 7 {
+        if minor > 8 || major > 8 {
             return Err(CodecError::unsupported(FormatVersion {
                 major,
                 minor: minor as u16,
@@ -282,7 +286,7 @@ fn read_pixel(
             let packed = rd.i32()?;
             px.state = Some(ctx.legacy_state(packed));
         } else if params & P_STATE_NEW != 0 {
-            let nbt = read_named_nbt(rd)?;
+            let nbt = read_state_nbt(rd, framing.major)?;
             let name = nbt.name.unwrap_or_default();
             px.state = Some(ctx.palettes.push_state(nbt.raw, name));
         } else {
@@ -380,7 +384,7 @@ fn read_overlay(rd: &mut Rd<'_>, framing: Framing, ctx: &mut Ctx<'_>) -> Result<
             let packed = rd.i32()?;
             ov.state = Some(ctx.legacy_state(packed));
         } else if params & O_STATE_NEW != 0 {
-            let nbt = read_named_nbt(rd)?;
+            let nbt = read_state_nbt(rd, framing.major)?;
             let name = nbt.name.unwrap_or_default();
             ov.state = Some(ctx.palettes.push_state(nbt.raw, name));
         } else {

@@ -261,9 +261,10 @@ fn check_layer(world: &str, layer: Layer, sample: usize) -> Option<LayerReport> 
 }
 
 /// Region copies the live layer cannot see. `MapSaveLoad.backupFile` *moves*
-/// the live file into `<version>_backup_<n>/` before rewriting it at a newer
-/// save version, so a crash between the two leaves that copy as the only one
-/// there is — 299 such regions on the reference archive. Syncthing conflict
+/// a live file whose save version is too new for the build loading it into
+/// `<version>_backup_<n>/`, and that build only writes a fresh one if it maps
+/// the region again — 299 regions on the reference archive survive only as
+/// that copy. Syncthing conflict
 /// files are the same story from the other direction: real data the game will
 /// never open again.
 fn alternate_issues(dir: &Path) -> Vec<Issue> {
@@ -298,8 +299,8 @@ fn alternate_issues(dir: &Path) -> Vec<Issue> {
     if !orphan_backups.is_empty() {
         out.push(Issue {
             kind: "backup only",
-            detail: "no live region at these coordinates — the pre-conversion \
-                     backup is the only copy left"
+            detail: "no live region at these coordinates — the copy an older \
+                     build of the mod moved aside as too new is the only one left"
                 .to_string(),
             count: orphan_backups.len(),
             exact: true,

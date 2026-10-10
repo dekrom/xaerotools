@@ -1,4 +1,4 @@
-//! Region stream codec: decode (every version the game reads: majors 0..=7,
+//! Region stream codec: decode (every version the game reads: majors 0..=8,
 //! minors ..=8, plus pre-versioned saves) and encode (7.8).
 
 pub mod legacy;
@@ -35,7 +35,7 @@ pub enum CodecError {
     Empty,
     #[error("stream truncated inside the header")]
     TruncatedHeader,
-    #[error("unsupported region save version {version} (XaeroTools reads up to 7.8{hint})")]
+    #[error("unsupported region save version {version} (XaeroTools reads up to 8.8{hint})")]
     UnsupportedVersion {
         version: FormatVersion,
         /// True when the file is *newer* than we support (update us, not the file).
@@ -52,7 +52,7 @@ pub enum CodecError {
 
 impl CodecError {
     pub(crate) fn unsupported(version: FormatVersion) -> Self {
-        let newer = version.major > 7 || (version.major == 7 && version.minor > 8);
+        let newer = version.major > 8 || version.minor > 8;
         CodecError::UnsupportedVersion {
             version,
             newer,
