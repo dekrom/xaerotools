@@ -1,0 +1,11 @@
+[package]
+name = "xaero-anvil"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+flate2 = "1"
+smallvec = "1"
+xaero-core = { path = "../xaero-core" }
+xaero-zvcr = { path = "../xaero-zvcr" }

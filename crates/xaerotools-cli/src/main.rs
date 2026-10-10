@@ -7,6 +7,7 @@
 
 mod archive;
 mod doctor;
+mod import_anvil;
 mod import_zvcr;
 mod render;
 mod stats;
@@ -26,6 +27,7 @@ fn main() {
         Some("doctor") => doctor::doctor_cmd(&args[1..]),
         Some("serve") => serve_cmd(&args[1..], false),
         Some("merge") => merge_cmd(&args[1..]),
+        Some("import-anvil") => import_anvil::import_anvil_cmd(&args[1..]),
         Some("import-zvcr") => import_zvcr::import_zvcr_cmd(&args[1..]),
         Some("db-merge") => db_merge_cmd(&args[1..]),
         Some("waypoints") => waypoints_cmd(&args[1..]),
@@ -65,6 +67,7 @@ fn print_help() {
     eprintln!("  xaerotools merge <A> <B> -o OUT [--apply] [--prefer mtime|a|b] [--resume]");
     eprintln!("                   [--server NAME]... [--alias X=Y]... [--yes] [--json]");
     eprintln!("  xaerotools db-merge <BASE.db> <SRC.db>... [-o OUT.db] [--apply] [--json]");
+    eprintln!("  xaerotools import-anvil --src DIR... -o OUT_ROOT [--dim D] [--world W] [--mw MW]");
     eprintln!("  xaerotools import-zvcr --src DIR... -o OUT_ROOT [--world W] [--mw MW]");
     eprintln!("                   [--threads N] [--limit N] [--overwrite] [--dry-run]");
     eprintln!("                   [--no-nether-roof-removal]");

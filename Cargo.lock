@@ -1660,6 +1660,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "xaero-anvil"
+version = "0.5.0"
+dependencies = [
+ "flate2",
+ "smallvec",
+ "xaero-core",
+ "xaero-zvcr",
+]
+
+[[package]]
 name = "xaero-colorgen"
 version = "0.5.0"
 dependencies = [
@@ -1734,6 +1744,7 @@ dependencies = [
  "serde_json",
  "test-support",
  "tokio",
+ "xaero-anvil",
  "xaero-core",
  "xaero-db",
  "xaero-merge",
